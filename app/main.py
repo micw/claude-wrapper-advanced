@@ -13,11 +13,13 @@ from .config import settings
 from .cli_driver import drive_turn
 from .metrics import metrics
 from .translate import (
+    EFFORT_LEVELS,
     finish_from_stop,
     map_effort,
     map_model,
     messages_to_prompt,
     openai_tools_to_mcp,
+    split_model_effort,
     tooluse_to_toolcalls,
 )
 
@@ -99,9 +101,14 @@ async def get_metrics():
 async def list_models(req: Request):
     _require_auth(req)
     now = int(time.time())
+    ids = []
+    for m in settings.models:
+        ids.append(m)
+        if settings.effort_variants:                 # 'opus:max' etc. -> Picker = Effort-Selektor
+            ids += [f"{m}:{lvl}" for lvl in EFFORT_LEVELS]
     return {"object": "list",
-            "data": [{"id": m, "object": "model", "created": now, "owned_by": "anthropic"}
-                     for m in settings.models]}
+            "data": [{"id": i, "object": "model", "created": now, "owned_by": "anthropic"}
+                     for i in ids]}
 
 
 def _chunk(cid, model, delta, finish=None):
@@ -125,10 +132,13 @@ async def chat_completions(req: Request):
 
     tools = body.get("tools") or []
     req_model = body.get("model") or settings.default_model
-    cli_model = map_model(req_model)
+    # Modell-Suffix 'opus:max' -> Basismodell + Effort. Der Suffix ist der explizite
+    # UI-Pick (Model-Picker als Effort-Selektor) und schlägt den Body-reasoning_effort.
+    base_model, effort_from_name = split_model_effort(req_model)
+    cli_model = map_model(base_model)
     stream = bool(body.get("stream"))
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
-    effort = map_effort(body)  # per-Request Reasoning-Effort; None -> Env-Default
+    effort = effort_from_name or map_effort(body)  # Name-Suffix > Body > Env-Default
 
     prompt = messages_to_prompt(messages)
     mcp_tools = openai_tools_to_mcp(tools)

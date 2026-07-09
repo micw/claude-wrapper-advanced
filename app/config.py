@@ -40,6 +40,9 @@ class Settings:
         # Nach außen exponierte Modell-IDs (die CLI akzeptiert diese Aliase direkt).
         self.models = ["sonnet", "opus", "haiku"]
         self.known_models = set(self.models) | {"default"}
+        # Effort-Varianten (z.B. 'opus:max') zusätzlich in /v1/models listen, damit der
+        # Modell-Picker als Effort-Selektor dient (für UIs ohne eigenes Effort-Control).
+        self.effort_variants = _truthy(os.getenv("EFFORT_VARIANTS", "1"))
         # Neutrales Arbeitsverzeichnis, damit die CLI kein CLAUDE.md/Projekt aufsammelt.
         self.workdir = os.getenv("WORKDIR") or tempfile.mkdtemp(prefix="claude-proxy-")
 

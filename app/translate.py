@@ -129,6 +129,22 @@ _EFFORT_MAP = {
     "none": "low", "minimal": "low", "low": "low",
     "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max",
 }
+# Direkt exponierbare Effort-Stufen (für Modell-Varianten wie 'opus:max').
+EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
+
+
+def split_model_effort(m):
+    """'opus:max' -> ('opus', 'max'). Suffix nur splitten, wenn es eine Effort-Stufe ist.
+
+    Voller CLI-Name (claude-opus-4-8) oder 'opus[1m]' bleiben unangetastet, wenn kein
+    gültiger Effort-Suffix dranhängt. Rückgabe: (base_model, effort|None).
+    """
+    if m and ":" in m:
+        base, _, suffix = m.rpartition(":")
+        eff = _EFFORT_MAP.get(suffix.strip().lower())
+        if eff and base:
+            return base, eff
+    return m, None
 
 
 def map_effort(body):
