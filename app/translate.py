@@ -35,11 +35,19 @@ def _text(content) -> str:
     return str(content)
 
 
-def messages_to_prompt(messages) -> str:
-    """Gesamte OpenAI-History zu EINEM Prompt flatten (die CLI antwortet sonst auf jede user-Message).
+def messages_to_prompt(messages):
+    """OpenAI-History -> CLI-User-content (die CLI antwortet sonst auf jede user-Message).
 
     Frühere Tool-Interaktionen werden als Text dargestellt (die CLI akzeptiert keine
     injizierten tool_use/tool_result-Blöcke). Das Modell vertraut diesen Text-Ergebnissen.
+
+    Rückgabe:
+      - cache_history AUS: EIN flacher String.
+      - cache_history AN : content-ARRAY mit je einem Block PRO Nachricht (bereits
+        abgeschlossene Nachrichten bleiben so über Turns byte-stabil) + cache_control auf
+        dem letzten Block. Anthropic cached blockweise -> die ganze append-stabile History
+        wird inkrementell gecacht (nur der neue Turn ist fresh input). Empirisch verifiziert
+        über 50 Turns: create/Turn bleibt konstant statt mit der History zu wachsen.
     """
     id_to_name = {}
     has_image = False
@@ -55,28 +63,31 @@ def messages_to_prompt(messages) -> str:
     if has_image:
         log.warning("Request enthält Bild-Parts — werden aktuell ignoriert (kein Vision-Support).")
 
-    lines = []
+    # Pro Nachricht EIN gerenderter Text (damit abgeschlossene Nachrichten stabile Blöcke bleiben).
+    msgs = []
     for m in messages:
         role = m.get("role")
         c = _text(m.get("content"))
+        parts = []
         if role == "system":
-            lines.append("[System instructions]\n" + c)
+            parts.append("[System instructions]\n" + c)
         elif role == "user":
-            lines.append("User: " + c)
+            parts.append("User: " + c)
         elif role == "assistant":
             if c:
-                lines.append("Assistant: " + c)
+                parts.append("Assistant: " + c)
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
-                lines.append(
+                parts.append(
                     f'Assistant: [called tool {fn.get("name")} with arguments {fn.get("arguments")}]'
                 )
         elif role == "tool":
             name = id_to_name.get(m.get("tool_call_id"), "tool")
-            lines.append(f"Tool {name} returned: {c}")
-        else:
-            if c:
-                lines.append(c)
+            parts.append(f"Tool {name} returned: {c}")
+        elif c:
+            parts.append(c)
+        if parts:
+            msgs.append("\n".join(parts))
 
     preamble = (
         "You are the assistant in a conversation exposed through an OpenAI-compatible API. "
@@ -85,7 +96,18 @@ def messages_to_prompt(messages) -> str:
         "Call an available tool only when you need new information it provides.\n\n"
     )
     closing = "\n\nRespond to the latest message now."
-    return preamble + "\n".join(lines) + closing
+
+    if not settings.cache_history:
+        return preamble + "\n".join(msgs) + closing
+
+    blocks = [{"type": "text", "text": preamble}]
+    for i, text in enumerate(msgs):
+        b = {"type": "text", "text": text + "\n"}   # Separator im Block halten (append-stabil)
+        if i == len(msgs) - 1:                        # cache_control auf den letzten (neuesten) Block
+            b["cache_control"] = {"type": "ephemeral", "ttl": settings.cache_history_ttl}
+        blocks.append(b)
+    blocks.append({"type": "text", "text": closing})
+    return blocks
 
 
 def openai_tools_to_mcp(tools):

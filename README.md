@@ -25,7 +25,7 @@ genuine drop-in OpenAI backend:
 - **Observability** — `/metrics` exposes latency bands (ttft / spawn / overhead), cache hit-rate and the
   account-wide rate-limit status.
 - **Subscription-native & ToS-clean** — uses the official CLI login, never extracts tokens or touches the
-  raw API. Ships as a non-root, Node-free container with in-container login.
+  raw API. Ships as a non-root container with in-container login.
 
 ## How it works (in short)
 

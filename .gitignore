@@ -1,2 +1,9 @@
 .env
 __pycache__/
+.venv/
+
+# Throwaway PoC (delete when done)
+mcp-roundtrip-test/
+
+# Raw HTTP capture — contains a real Authorization: Bearer token. Do NOT commit.
+system-prompts/copilot.txt

@@ -30,6 +30,11 @@ class Settings:
         # CLI-stderr mitloggen (Default: an, wenn DEBUG).
         self.log_cli_stderr = _truthy(os.getenv("LOG_CLI_STDERR", "1" if self.debug else "0"))
         self.metrics_window = int(os.getenv("METRICS_WINDOW", "1000"))
+        # History-Caching: User-Message als Content-Array [History+cache_control, Tail] senden,
+        # damit die (append-stabile) History inkrementell gecacht wird (nur neuer Turn = fresh input).
+        # Empirisch: braucht die ttl-Form wie der CLI-System-Block; ohne ttl verwirft die CLI die Message.
+        self.cache_history = _truthy(os.getenv("CACHE_HISTORY", "1"))
+        self.cache_history_ttl = os.getenv("CACHE_HISTORY_TTL", "1h")     # 1h | 5m
         # Prozess-Pool (Reuse) — spart Spawn/Init-Overhead pro Request.
         self.pool_enabled = _truthy(os.getenv("POOL_ENABLED", "1"))
         self.pool_max_procs = int(os.getenv("POOL_MAX_PROCS", "8"))

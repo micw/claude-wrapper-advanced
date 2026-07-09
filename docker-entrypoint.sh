@@ -6,9 +6,11 @@ set -euo pipefail
 
 status="$(claude auth status --json 2>/dev/null || true)"
 if printf '%s' "$status" | grep -q '"loggedIn": *true'; then
-  email="$(printf '%s' "$status" | grep -oE '"email": *"[^"]*"' | cut -d'"' -f4)"
-  plan="$(printf '%s' "$status" | grep -oE '"subscriptionType": *"[^"]*"' | cut -d'"' -f4)"
-  echo "[entrypoint] Claude CLI authenticated (${email:-?}, plan=${plan:-?})."
+  # email/subscriptionType fehlen bei Token-Auth (CLAUDE_CODE_OAUTH_TOKEN). '|| true', damit ein
+  # leeres grep unter 'set -euo pipefail' den Entrypoint NICHT vor uvicorn abbrechen lässt.
+  email="$(printf '%s' "$status" | grep -oE '"email": *"[^"]*"' | cut -d'"' -f4 || true)"
+  plan="$(printf '%s' "$status" | grep -oE '"subscriptionType": *"[^"]*"' | cut -d'"' -f4 || true)"
+  echo "[entrypoint] Claude CLI authenticated (${email:-token}, plan=${plan:-?})."
 else
   cat <<'EOF'
 ========================================================================
