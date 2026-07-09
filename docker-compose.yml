@@ -1,0 +1,26 @@
+services:
+  proxy:
+    build:
+      context: .
+      args:
+        # Pin the CLI for reproducible builds, e.g. CLAUDE_VERSION=2.1.181
+        CLAUDE_VERSION: ${CLAUDE_VERSION:-latest}
+    image: claude-wrapper-advanced
+    # Published on localhost only by default. Override PROXY_PORT to change the host port.
+    ports:
+      - "127.0.0.1:${PROXY_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # Force the in-container bind + port regardless of what .env sets (host mapping is above).
+      HOST: 0.0.0.0
+      PORT: "8000"
+      CLAUDE_CONFIG_DIR: /home/app/.claude
+    # Auth option B: persists `claude /login` credentials so the CLI can refresh them.
+    # Harmless when using CLAUDE_CODE_OAUTH_TOKEN (option A) — it just holds cache then.
+    volumes:
+      - claude-auth:/home/app/.claude
+    restart: unless-stopped
+
+volumes:
+  claude-auth:

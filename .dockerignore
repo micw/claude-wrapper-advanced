@@ -1,0 +1,18 @@
+.git
+.gitignore
+.env
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+# Docs & scratch — not needed in the image
+*.md
+KONZEPT.md
+README.md
+system-prompts
+mcp-roundtrip-test
+scratchpad
+Dockerfile
+docker-compose.yml
+.dockerignore

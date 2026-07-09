@@ -1,9 +1,31 @@
-# claude-openai-proxy
+# claude-wrapper-advanced
 
-OpenAI-compatible HTTP endpoint (`/v1/chat/completions`, `/v1/models`) built on top of the official
-**Claude Code CLI** — uses your **Pro/Max subscription** instead of separate API credits.
+**An advanced wrapper that exposes the Claude Code CLI as an OpenAI-compatible REST API** —
+driven by your **Pro/Max subscription** instead of separate API credits.
 
+Endpoints: `/v1/chat/completions` (streaming + non-streaming), `/v1/models`, plus `/healthz` and `/metrics`.
 Design, rationale and the empirical findings live in [KONZEPT.md](KONZEPT.md).
+
+## Why "advanced"?
+
+A naive wrapper just pipes text through `claude -p`. This one does the hard parts that make it a
+genuine drop-in OpenAI backend:
+
+- **Native tool calling** — a request's `tools` become real MCP tools, so Claude emits a *native*
+  `tool_use`; we capture it (MCP stall + interrupt) and return standard OpenAI `tool_calls`. No brittle
+  scraping of the model's prose.
+- **Faithful history replay** — the entire OpenAI `messages` array (including prior tool calls/results)
+  is reconstructed into a single prompt the CLI accepts, so multi-turn conversations and tool loops work.
+- **Warm process pool** — CLI processes stay alive and are recycled via `/clear`, bucketed by
+  model + toolset, with liveness checks, retry-on-dead and idle eviction. Saves the ~0.8 s spawn/init per call.
+- **Prompt-cache aware** — a stable tool/system prefix yields high cache-hit rates (tracked live at `/metrics`).
+- **Per-request effort control** — OpenAI `reasoning_effort`, OpenRouter `reasoning.effort`, or a
+  model-name suffix like `opus:max` (the model picker doubles as an effort selector).
+- **Real usage & cost** — OpenAI `usage` plus an OpenRouter-style `cost`, with cache read/write token stats.
+- **Observability** — `/metrics` exposes latency bands (ttft / spawn / overhead), cache hit-rate and the
+  account-wide rate-limit status.
+- **Subscription-native & ToS-clean** — uses the official CLI login, never extracts tokens or touches the
+  raw API. Ships as a non-root, Node-free container with in-container login.
 
 ## How it works (in short)
 
@@ -34,6 +56,41 @@ cp .env.example .env      # optionally adjust (port, API_KEY, DEFAULT_MODEL)
 ```
 
 The server then runs on `http://127.0.0.1:8000`.
+
+## Docker
+
+The image bundles the official Claude Code CLI (via npm) and runs as a **non-root** user
+(Claude Code refuses `--dangerously-skip-permissions` as root, which the MCP tool path needs).
+
+```bash
+cp .env.example .env        # optional: adjust API_KEY, DEFAULT_MODEL, PROXY_PORT
+docker compose up -d --build
+```
+
+The container **starts even without authentication** — it stays up and logs a login hint so you
+can sign in from inside. There are two ToS-clean ways to authenticate your subscription:
+
+**A) Interactive login (recommended, persistent).** Log in once inside the running container;
+credentials land in a mounted volume and the CLI refreshes them itself:
+
+```bash
+docker compose exec proxy claude /login     # opens a URL — authorize, paste the code back
+docker compose restart proxy                # optional; picks up the login immediately
+curl -s localhost:8000/healthz | jq         # -> "authenticated": true
+```
+
+**B) Long-lived token (headless/CI).** `claude setup-token` is the official subscription-scoped
+command (not credential extraction — ToS-clean). Generate it, then set it in `.env`:
+
+```bash
+docker compose exec proxy claude setup-token   # prints a ~1-year token
+# put it in .env as CLAUDE_CODE_OAUTH_TOKEN=..., then:
+docker compose up -d
+```
+
+Until authenticated, `/v1/*` requests return **503** with a clear message, and `/healthz`
+reports `"authenticated": false`. The published port is `127.0.0.1:${PROXY_PORT:-8000}` (localhost
+only); pin the CLI with `CLAUDE_VERSION=<x.y.z>` as a build arg for reproducible images.
 
 ## Quick test (curl)
 
