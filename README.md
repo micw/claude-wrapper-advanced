@@ -155,3 +155,22 @@ Always run the curl quick test before testing in the editor.
 - **No reasoning/thinking text** (the CLI does not emit it).
 - Latency is inference-dominated (~3s/turn; one tool round-trip = 2 turns).
 - Per-request `cost` in `usage` is distorted for tool-call turns (cumulative cost is correct); see the pool notes in the code.
+
+## Assumption tests
+
+This proxy is built on ~30 behaviours of the Claude Code CLI and the Anthropic backend that were
+established empirically (the CLI replies to every message, native `tool_use` capture, text-injected
+tool results are trusted, block-level prompt caching, the `ttl` requirement on `cache_control`, the
+result/usage JSON shape, …). A CLI update can silently break any of them.
+
+[`tests/assumptions.py`](tests/assumptions.py) encodes these as an executable checklist that exercises
+the real CLI **and** our wrapper, and reports PASS/FAIL/SKIP per assumption. Run it whenever the CLI
+is upgraded — Tier 1 is offline and free (catches renamed/removed flags instantly), Tier 2 verifies
+behaviour against the backend:
+
+```bash
+python tests/assumptions.py --offline   # fast, no backend
+python tests/assumptions.py             # full (needs login, costs a few tokens)
+```
+
+See [tests/README.md](tests/README.md) for the workflow and how to add an assumption.
