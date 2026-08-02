@@ -28,11 +28,91 @@ def _text(content) -> str:
             if isinstance(p, dict):
                 if p.get("type") == "text":
                     parts.append(p.get("text", ""))
-                # Bilder etc. werden vorerst ignoriert.
+                # Bild-Parts kommen separat als eigene Blöcke (siehe _images).
             elif isinstance(p, str):
                 parts.append(p)
         return "\n".join(parts)
     return str(content)
+
+
+# Part-Typen, die ein Bild tragen: OpenAI Chat (image_url), OpenAI Responses
+# (input_image) und die Anthropic-Form (image) für Clients, die sie direkt schicken.
+_IMAGE_PART_TYPES = ("image_url", "input_image", "image")
+# Vom Backend akzeptierte Bildformate — alles andere wird mit 400 abgelehnt.
+_IMAGE_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_MEDIA_ALIASES = {"image/jpg": "image/jpeg"}
+
+# Nur base64/data-URI wird unterstützt — bewusst KEINE Remote-URLs:
+#  - Das Backend selbst laden zu lassen (source.type "url") scheitert praktisch (robots.txt,
+#    nicht öffentlich erreichbare Adressen) und kippt dann den KOMPLETTEN Request mit 400.
+#  - Im Wrapper laden würde die Session nicht-deterministisch machen: die History wird jeden Turn
+#    neu geschickt, also würde dieselbe URL pro Turn neu geladen — ändern sich die Bytes, bricht
+#    der Cache-Prefix, und die Fetch-Latenz fällt jedes Mal an. Außerdem: ausgehende Requests auf
+#    client-gelieferte URLs (SSRF-Fläche).
+# Wer ein Bild per Link will, nimmt ein Web-Fetch-Tool des Clients — dann ist der Inhalt
+# regulärer Teil der Session statt eines unsichtbaren Seiteneffekts.
+_REMOTE_UNSUPPORTED = "remote image URLs are not supported, only inline (base64) images"
+
+
+def _data_uri_source(url):
+    """'data:image/png;base64,AAAA' -> Anthropic base64-source. (source|None, Grund)."""
+    head, _, data = url.partition(",")
+    if not data or "base64" not in head:
+        return None, "only base64 data URIs are supported"
+    return _base64_source(head[len("data:"):].split(";")[0].strip().lower(), data)
+
+
+def _base64_source(media, data):
+    """base64-Bild -> Anthropic source, normalisiert & gegen die Limits geprüft. (source|None, Grund)."""
+    media = _MEDIA_ALIASES.get(media, media)
+    if media not in _IMAGE_MEDIA_TYPES:
+        return None, f"unsupported media type {media or '(none)'}"
+    # Größe ohne Dekodieren abschätzen: base64 ist ~4/3 der Rohbytes.
+    size = len(data) * 3 // 4
+    if size > settings.max_image_bytes:
+        return None, f"too large ({size // (1024 * 1024)} MB > {settings.max_image_mb:g} MB)"
+    return {"type": "base64", "media_type": media, "data": data}, ""
+
+
+def _image_source(part):
+    """Bild-Part (OpenAI/Anthropic) -> Anthropic image.source. (source|None, Grund)."""
+    src = part.get("source")
+    if part.get("type") == "image" and isinstance(src, dict):   # bereits Anthropic-Form
+        if src.get("type") == "base64":                          # normalisieren + gegen Limits prüfen
+            return _base64_source((src.get("media_type") or "").lower(), src.get("data") or "")
+        return None, _REMOTE_UNSUPPORTED                          # source.type "url" -> siehe unten
+    url = part.get("image_url") or part.get("url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    if not isinstance(url, str) or not url:
+        return None, "no image data in the part"
+    if url.startswith("data:"):
+        return _data_uri_source(url)
+    return None, _REMOTE_UNSUPPORTED
+
+
+def _images(content):
+    """Bild-Parts einer Message -> (Anthropic image-Blöcke, Hinweise auf Verworfenes).
+
+    Verworfenes wird als Text angemerkt, damit das Modell nicht über ein Bild redet,
+    das nie ankam (sonst: "ich sehe nur einen Datei-Verweis").
+    """
+    if not isinstance(content, list):
+        return [], []
+    blocks, notes = [], []
+    for p in content:
+        if not isinstance(p, dict) or p.get("type") not in _IMAGE_PART_TYPES:
+            continue
+        if len(blocks) >= settings.max_images:
+            notes.append(f"[an image was dropped: more than {settings.max_images} images]")
+            continue
+        src, why = _image_source(p)
+        if src:
+            blocks.append({"type": "image", "source": src})
+        else:
+            log.warning("Bild-Part verworfen: %s", why)
+            notes.append(f"[an image could not be passed through: {why}]")
+    return blocks, notes
 
 
 def messages_to_prompt(messages):
@@ -41,8 +121,12 @@ def messages_to_prompt(messages):
     Frühere Tool-Interaktionen werden als Text dargestellt (die CLI akzeptiert keine
     injizierten tool_use/tool_result-Blöcke). Das Modell vertraut diesen Text-Ergebnissen.
 
+    Bild-Parts (OpenWebUI & Co. schicken beim Paste ein image_url mit data-URI) werden als
+    native Anthropic image-Blöcke mitgesendet — die CLI reicht sie über stream-json durch.
+    Sie stehen jeweils VOR dem Text ihrer Nachricht.
+
     Rückgabe:
-      - cache_history AUS: EIN flacher String.
+      - cache_history AUS und keine Bilder: EIN flacher String.
       - cache_history AN : content-ARRAY mit je einem Block PRO Nachricht (bereits
         abgeschlossene Nachrichten bleiben so über Turns byte-stabil) + cache_control auf
         dem letzten Block. Anthropic cached blockweise -> die ganze append-stabile History
@@ -50,24 +134,18 @@ def messages_to_prompt(messages):
         über 50 Turns: create/Turn bleibt konstant statt mit der History zu wachsen.
     """
     id_to_name = {}
-    has_image = False
     for m in messages:
         if m.get("role") == "assistant":
             for tc in m.get("tool_calls") or []:
                 id_to_name[tc.get("id")] = (tc.get("function") or {}).get("name")
-        c = m.get("content")
-        if isinstance(c, list):
-            for p in c:
-                if isinstance(p, dict) and p.get("type") in ("image_url", "image", "input_image"):
-                    has_image = True
-    if has_image:
-        log.warning("Request enthält Bild-Parts — werden aktuell ignoriert (kein Vision-Support).")
 
-    # Pro Nachricht EIN gerenderter Text (damit abgeschlossene Nachrichten stabile Blöcke bleiben).
+    # Pro Nachricht EIN gerenderter Text (damit abgeschlossene Nachrichten stabile Blöcke bleiben)
+    # plus deren Bild-Blöcke.
     msgs = []
     for m in messages:
         role = m.get("role")
         c = _text(m.get("content"))
+        images, notes = _images(m.get("content"))
         parts = []
         if role == "system":
             parts.append("[System instructions]\n" + c)
@@ -86,8 +164,9 @@ def messages_to_prompt(messages):
             parts.append(f"Tool {name} returned: {c}")
         elif c:
             parts.append(c)
-        if parts:
-            msgs.append("\n".join(parts))
+        parts += notes
+        if parts or images:
+            msgs.append(("\n".join(parts), images))
 
     preamble = (
         "You are the assistant in a conversation exposed through an OpenAI-compatible API. "
@@ -97,15 +176,21 @@ def messages_to_prompt(messages):
     )
     closing = "\n\nRespond to the latest message now."
 
-    if not settings.cache_history:
-        return preamble + "\n".join(msgs) + closing
+    n_images = sum(len(imgs) for _, imgs in msgs)
+    if n_images:
+        log.debug("Request enthält %d Bild-Block(s)", n_images)
+
+    # Ohne Bilder UND ohne History-Caching bleibt es beim flachen String (unverändertes Verhalten).
+    if not settings.cache_history and not n_images:
+        return preamble + "\n".join(text for text, _ in msgs) + closing
 
     blocks = [{"type": "text", "text": preamble}]
-    for i, text in enumerate(msgs):
-        b = {"type": "text", "text": text + "\n"}   # Separator im Block halten (append-stabil)
-        if i == len(msgs) - 1:                        # cache_control auf den letzten (neuesten) Block
-            b["cache_control"] = {"type": "ephemeral", "ttl": settings.cache_history_ttl}
-        blocks.append(b)
+    for text, images in msgs:
+        blocks += images                              # Bild vor Text (Backend-Empfehlung)
+        if text:
+            blocks.append({"type": "text", "text": text + "\n"})  # Separator im Block halten (append-stabil)
+    if settings.cache_history and len(blocks) > 1:    # cache_control auf den letzten (neuesten) Block
+        blocks[-1]["cache_control"] = {"type": "ephemeral", "ttl": settings.cache_history_ttl}
     blocks.append({"type": "text", "text": closing})
     return blocks
 

@@ -46,8 +46,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Optional: pin the bundled CLI by setting a repo variable CLAUDE_VERSION (e.g. 2.1.205).
+          # The CLI version is pinned in the Dockerfile (only versions the assumption tests passed
+          # on). Override with the repo variable CLAUDE_VERSION — after running the suite.
           build-args: |
-            CLAUDE_VERSION=${{ vars.CLAUDE_VERSION || 'latest' }}
+            ${{ vars.CLAUDE_VERSION && format('CLAUDE_VERSION={0}', vars.CLAUDE_VERSION) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -14,7 +14,7 @@ import time
 from collections import defaultdict, deque
 
 from .config import settings
-from .cli_driver import _build_args, classify
+from .cli_driver import _build_args, child_env, classify
 
 log = logging.getLogger("pool")
 
@@ -56,6 +56,7 @@ class Proc:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=settings.workdir,
+            env=child_env(),
         )
         self._err_task = asyncio.create_task(self._drain_err())
         # Warm-up: /clear löst die CLI-Init aus (token-frei) und macht die Instanz nutzbar.

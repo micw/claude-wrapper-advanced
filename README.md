@@ -19,6 +19,8 @@ genuine drop-in OpenAI backend:
 - **Warm process pool** — CLI processes stay alive and are recycled via `/clear`, bucketed by
   model + toolset, with liveness checks, retry-on-dead and idle eviction. Saves the ~0.8 s spawn/init per call.
 - **Prompt-cache aware** — a stable tool/system prefix yields high cache-hit rates (tracked live at `/metrics`).
+- **Vision** — inline OpenAI `image_url` parts (base64 data URI) become native image blocks, so
+  pasting a screenshot in Open WebUI & Co. just works, in the current turn and in history.
 - **Per-request effort control** — OpenAI `reasoning_effort`, OpenRouter `reasoning.effort`, or a
   model-name suffix like `opus:max` (the model picker doubles as an effort selector).
 - **Real usage & cost** — OpenAI `usage` plus an OpenRouter-style `cost`, with cache read/write token stats.
@@ -31,6 +33,17 @@ genuine drop-in OpenAI backend:
 
 - The entire OpenAI history is flattened into **one** prompt (otherwise the CLI would reply to every user message).
 - Earlier tool calls/results are rendered as **text** (the CLI rejects injected tool blocks — but it trusts the text).
+- **Images** are the exception to "flatten to text": they are passed to the CLI as native `image`
+  blocks (base64), placed right before the text of their message. Images that can't be passed through
+  (too large, unsupported format, remote URL) are dropped with a note in the history, so the model
+  says *what* is missing instead of ignoring it.
+- **Remote image URLs are deliberately not supported.** Letting the backend fetch them
+  (`source.type: "url"`) fails in practice — robots.txt, or hosts it can't reach such as Open WebUI's
+  own `/cache/image/…` — and that failure 400s the *whole* request. Fetching them in the wrapper
+  instead would break determinism: the history is re-sent every turn, so the same URL would be
+  re-fetched every turn, and any byte change invalidates the cache prefix. If someone wants an image
+  from a link, a web-fetch tool on the client side is the right place — then the content is a regular
+  part of the session instead of an invisible side effect.
 - The request's tools are declared as **real MCP tools** → Claude emits a **native** `tool_use`. Our MCP server **stalls** on the call, we read the call from the stream and return it as OpenAI `tool_calls` (the **client** executes the tool).
 - Process model: a **reuse pool** keeps warm CLI processes alive and recycles them via `/clear` (bucketed by model + toolset). It falls back to one-shot when disabled (`POOL_ENABLED=0`).
 
@@ -90,7 +103,24 @@ docker compose up -d
 
 Until authenticated, `/v1/*` requests return **503** with a clear message, and `/healthz`
 reports `"authenticated": false`. The published port is `127.0.0.1:${PROXY_PORT:-8000}` (localhost
-only); pin the CLI with `CLAUDE_VERSION=<x.y.z>` as a build arg for reproducible images.
+only).
+
+**The bundled CLI is pinned (`CLAUDE_VERSION=2.1.220`) on purpose** — only versions the assumption
+tests have passed on get shipped. To move the pin up, vet the new version first, then bump it in the
+Dockerfile:
+
+```bash
+npm install @anthropic-ai/claude-code@<x.y.z> --prefix /tmp/cli
+CLAUDE_BIN=/tmp/cli/node_modules/@anthropic-ai/claude-code-linux-x64/claude \
+  python tests/assumptions.py
+```
+
+**Don't run the proxy from inside a Claude Code session** without the env scrubbing the wrapper does
+for you (`child_env()` in [`app/cli_driver.py`](app/cli_driver.py)). A parent session exports
+`CLAUDE_CODE_ENTRYPOINT`, and since CLI 2.1.198 the child then puts a scratchpad path *with a session
+UUID* into its system prompt. Every `/clear` mints a new UUID, so the cached prefix never matches and
+the entire history is re-written each turn — measured: 100% `cache_read` drops to 0%, nothing errors,
+it just gets ~18× more expensive per follow-up turn. `env.no_parent_session` guards this.
 
 ## Quick test (curl)
 
@@ -169,8 +199,13 @@ is upgraded — Tier 1 is offline and free (catches renamed/removed flags instan
 behaviour against the backend:
 
 ```bash
-python tests/assumptions.py --offline   # fast, no backend
-python tests/assumptions.py             # full (needs login, costs a few tokens)
+python -m unittest discover -s tests -t .   # unit tests: free, ~5ms, no CLI/backend needed
+python tests/assumptions.py --offline       # fast, no backend
+python tests/assumptions.py                 # full (needs login, costs a few tokens)
 ```
+
+Everything decidable without the model lives in [`tests/test_translate.py`](tests/test_translate.py)
+as plain `unittest` (no pytest dependency) — history flattening, image handling and limits, and the
+byte-stability of the history prefix that the whole caching design rests on.
 
 See [tests/README.md](tests/README.md) for the workflow and how to add an assumption.

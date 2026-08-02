@@ -27,7 +27,7 @@ NONCE = f"{int(time.time())}-{os.getpid()}"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import settings                     # noqa: E402
-from app.cli_driver import _build_args              # noqa: E402
+from app.cli_driver import _PARENT_SESSION_VARS, _build_args, child_env  # noqa: E402
 from app.translate import messages_to_prompt, openai_tools_to_mcp  # noqa: E402
 
 CLAUDE = settings.claude_bin
@@ -71,9 +71,12 @@ class CLI:
         self.proc = None
 
     async def __aenter__(self):
+        # child_env() wie im Proxy — sonst verfälscht eine ELTERN-Claude-Code-Session die
+        # Cache-Messungen (siehe env.no_parent_session).
         self.proc = await asyncio.create_subprocess_exec(
             CLAUDE, *self.args, stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            env=child_env())
         return self
 
     async def __aexit__(self, *a):
@@ -191,6 +194,23 @@ async def c_setuptoken(ctx):
 
 
 # ================================================================ TIER 2: ONLINE
+@check("env.no_parent_session", 1, "Parent Claude Code session markers are stripped from the CLI env")
+async def c_childenv(ctx):
+    """Why this matters (cost us a bogus 'CLI regression' once): if the proxy runs inside a
+    Claude Code session, the CLI inherits CLAUDE_CODE_ENTRYPOINT — and since 2.1.198 it then adds
+    a scratchpad section WITH A SESSION UUID to its system prompt. Every /clear mints a new UUID,
+    so the cached prefix never matches and the whole history is re-written each turn
+    (measured: 100% cache_read -> 0%). child_env() removes those markers.
+    """
+    leaked = [v for v in _PARENT_SESSION_VARS if v in child_env()]
+    if leaked:
+        return FAIL(f"still in the child env: {leaked}")
+    if "CLAUDE_CODE_OAUTH_TOKEN" in os.environ and "CLAUDE_CODE_OAUTH_TOKEN" not in child_env():
+        return FAIL("child_env() dropped CLAUDE_CODE_OAUTH_TOKEN (auth would break)")
+    present = [v for v in _PARENT_SESSION_VARS if v in os.environ]
+    return OK(f"stripped: {present or 'none set here'}")
+
+
 @check("proto.basic", 2, "stream-json: user msg -> result event with text")
 async def c_basic(ctx):
     async with CLI() as cli:
@@ -482,6 +502,106 @@ async def c_effort(ctx):
             res[lvl] = bool(ev) and not ev.get("is_error")
     bad = [lvl for lvl, ok in res.items() if not ok]
     return OK(f"accepted: {list(res)}") if not bad else FAIL(f"rejected: {bad}")
+
+
+# 64x64 PNG, linke Hälfte rot / rechte Hälfte blau — klein genug für den Quelltext.
+def _test_png_b64():
+    import base64
+    import struct
+    import zlib
+    w = h = 64
+    raw = b"".join(b"\x00" + b"".join(b"\xff\x00\x00" if x < w // 2 else b"\x00\x00\xff"
+                                     for x in range(w)) for _ in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    return base64.b64encode(png).decode()
+
+
+@check("vision.image_block", 2, "stream-json accepts base64 image blocks (Vision works at all)")
+async def c_image(ctx):
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": _test_png_b64()}},
+        {"type": "text", "text": "Name the two colors in the image. Answer with the two words only."},
+    ]
+    async with CLI() as cli:
+        ev, _ = await cli.turn(content)
+    if not ev:
+        return FAIL("no result event")
+    if ev.get("is_error"):
+        return FAIL(f"CLI/API rejected the image block: {str(ev.get('result'))[:120]}")
+    txt = (ev.get("result") or "").lower()
+    ctx["image_seen"] = "red" in txt and "blue" in txt
+    return (OK(f"image understood: {txt[:60]!r}") if ctx["image_seen"]
+            else FAIL(f"accepted but colors not recognized: {txt[:80]!r}"))
+
+
+@check("vision.image_in_history", 2, "image block in an EARLIER message stays visible (multi-turn)")
+async def c_image_history(ctx):
+    if not ctx.get("image_seen"):
+        return SKIP("vision.image_block failed — nothing to build on")
+    # Wie translate.messages_to_prompt rendert: Bild VOR dem Text seiner Nachricht.
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": _test_png_b64()}},
+        {"type": "text", "text": "User: What is in the image?\n"},
+        {"type": "text", "text": "Assistant: A graphic with two color areas.\n"},
+        {"type": "text", "text": "User: Which color is on the LEFT half? One word only.\n"},
+    ]
+    async with CLI() as cli:
+        ev, _ = await cli.turn(content)
+    if not ev or ev.get("is_error"):
+        return FAIL(f"no/err result: {str((ev or {}).get('result'))[:120]}")
+    txt = (ev.get("result") or "").lower()
+    return OK(f"left half recognized: {txt[:60]!r}") if "red" in txt else FAIL(f"got {txt[:80]!r}")
+
+
+@check("vision.openai_payload", 2, "OpenAI image_url payload survives messages_to_prompt -> CLI")
+async def c_image_payload(ctx):
+    """The end-to-end path a pasted screenshot actually takes (this is what broke originally:
+    _text() dropped image parts, so only text reached the CLI).
+
+    Deliberately NOT gated on ctx: this is the regression test for our own rendering, it must
+    fail loudly on its own rather than skip when the suite is run filtered.
+    """
+    messages = [{"role": "user", "content": [                    # exactly what Open WebUI sends
+        {"type": "text", "text": "Name the two colors in the image. Answer with the two words only."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _test_png_b64()}},
+    ]}]
+    prompt = messages_to_prompt(messages)
+    if not isinstance(prompt, list) or not any(b.get("type") == "image" for b in prompt):
+        return FAIL("messages_to_prompt produced no image block")
+    async with CLI() as cli:
+        ev, _ = await cli.turn(prompt)
+    if not ev or ev.get("is_error"):
+        return FAIL(f"no/err result: {str((ev or {}).get('result'))[:120]}")
+    txt = (ev.get("result") or "").lower()
+    return (OK(f"end-to-end: {txt[:60]!r}") if "red" in txt and "blue" in txt
+            else FAIL(f"image did not reach the model: {txt[:80]!r}"))
+
+
+@check("vision.dropped_image_no_error", 2, "An unsupported image (remote URL) must NOT fail the turn")
+async def c_image_dropped(ctx):
+    """Remote URLs are deliberately unsupported. The turn must still complete — a 400 from a
+    passed-through url-source would kill the whole request instead of just the image."""
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "Reply with exactly: OK"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/nope.png"}},
+    ]}]
+    prompt = messages_to_prompt(messages)
+    if any(b.get("type") == "image" for b in prompt if isinstance(b, dict)):
+        return FAIL("remote URL was passed through as an image block")
+    if "could not be passed through" not in json.dumps(prompt):
+        return FAIL("no note about the dropped image reached the prompt")
+    async with CLI() as cli:
+        ev, _ = await cli.turn(prompt)
+    if not ev:
+        return FAIL("no result event")
+    return (FAIL(f"turn errored: {str(ev.get('result'))[:120]}") if ev.get("is_error")
+            else OK(f"turn completed, image dropped with a note: {str(ev.get('result'))[:40]!r}"))
 
 
 MANUAL = [
