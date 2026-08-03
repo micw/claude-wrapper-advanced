@@ -35,6 +35,11 @@ class Settings:
         # Empirisch: braucht die ttl-Form wie der CLI-System-Block; ohne ttl verwirft die CLI die Message.
         self.cache_history = _truthy(os.getenv("CACHE_HISTORY", "1"))
         self.cache_history_ttl = os.getenv("CACHE_HISTORY_TTL", "1h")     # 1h | 5m
+        # Bilder (Vision): Limits des Backends — größere/mehr Bilder werden verworfen
+        # und in der History als Hinweis vermerkt, statt den Request mit 400 zu killen.
+        self.max_image_mb = float(os.getenv("MAX_IMAGE_MB", "5"))
+        self.max_image_bytes = int(self.max_image_mb * 1024 * 1024)
+        self.max_images = int(os.getenv("MAX_IMAGES", "20"))
         # Prozess-Pool (Reuse) — spart Spawn/Init-Overhead pro Request.
         self.pool_enabled = _truthy(os.getenv("POOL_ENABLED", "1"))
         self.pool_max_procs = int(os.getenv("POOL_MAX_PROCS", "8"))

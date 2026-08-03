@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
         await pool.shutdown()
 
 
-app = FastAPI(title="claude-wrapper-advanced", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="claude-wrapper-advanced", version="1.1.0", lifespan=lifespan)
 
 _ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 

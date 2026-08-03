@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import sys
 import time
 from collections import deque
@@ -23,6 +24,27 @@ from .metrics import metrics
 
 log = logging.getLogger("cli")
 _MCP_SERVER = str(Path(__file__).parent / "mcp_tool_server.py")
+
+
+# Marker einer ELTERN-Claude-Code-Session. Wird der Proxy aus einem Claude-Code-Terminal
+# heraus gestartet, erbt die CLI sie — und ab 2.1.198 hängt sie dann einen Scratchpad-Abschnitt
+# MIT SESSION-UUID in ihren System-Prompt. Jedes /clear vergibt eine neue UUID -> der System-Block
+# ändert sich pro Turn -> der cache_control-Prefix trifft nie, die History wird jedes Mal neu
+# geschrieben (empirisch: 100% cache_read -> 0%). Deshalb beim Spawn entfernen.
+# NICHT entfernen: CLAUDE_CODE_OAUTH_TOKEN (Auth) und ANTHROPIC_* (Endpoint/Proxy).
+_PARENT_SESSION_VARS = (
+    "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_EXECPATH", "CLAUDE_AGENT_SDK_VERSION",
+    "CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT",
+)
+
+
+def child_env():
+    """Env für die CLI: Eltern-Session-Marker raus (siehe _PARENT_SESSION_VARS)."""
+    env = {k: v for k, v in os.environ.items() if k not in _PARENT_SESSION_VARS}
+    if len(env) != len(os.environ):
+        log.debug("Eltern-Session-Marker aus dem CLI-Env entfernt (Prompt-Cache-Schutz)")
+    return env
 
 
 def _build_args(mcp_tools, model, effort=None):
@@ -142,6 +164,7 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=settings.workdir,
+        env=child_env(),
     )
     stats["spawn_ms"] = (time.perf_counter() - t0) * 1000
     stats["reused"] = False

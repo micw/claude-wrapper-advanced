@@ -1,4 +1,24 @@
-# Assumption integration tests
+# Tests
+
+Two layers, deliberately separate:
+
+| | what it covers | needs | cost |
+|---|---|---|---|
+| [`test_translate.py`](test_translate.py) | **unit** — everything `translate.py` decides on its own: history flattening, image blocks, limits, `cache_control` placement, model/effort mapping | nothing | ~5 ms, 0 tokens |
+| [`assumptions.py`](assumptions.py) | **integration** — what the CLI and the backend actually do | login | tokens, minutes |
+
+```bash
+python -m unittest discover -s tests -t .   # unit, run these constantly
+python tests/assumptions.py --offline       # integration tier 1, no backend
+python tests/assumptions.py                 # integration tier 1+2
+```
+
+Rule of thumb: anything decidable without the model belongs in `test_translate.py` — it is free, so
+it can cover the edge cases (oversized images, unsupported formats, byte-stability of the history
+prefix) that would be absurd to spend tokens on. `assumptions.py` is only for claims about the
+*outside world*.
+
+## Assumption integration tests
 
 The proxy is built on ~30 empirically discovered behaviours of the Claude Code CLI and the
 Anthropic backend. A CLI update can silently break any of them. `assumptions.py` checks them in
