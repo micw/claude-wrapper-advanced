@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import responses as rsp
 from .auth import auth_status
 from .config import settings
 from .cli_driver import drive_turn
@@ -61,6 +62,10 @@ def _usage_out(stats):
     cost = stats.get("cost_usd")
     if cost is not None:
         usage["cost"] = cost
+    think = stats.get("thinking_tokens")
+    if think:                                  # OpenAI-Standardort im Chat-Format; gedeckelt wie
+        usage["completion_tokens_details"] = {  # in responses.usage_obj (es ist eine Schätzung).
+            "reasoning_tokens": min(think, usage.get("completion_tokens", 0))}
     return usage
 
 
@@ -270,3 +275,203 @@ async def chat_completions(req: Request):
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "usage": _usage_out(stats),
     })
+
+
+# ---------------------------------------------------------------- /v1/responses
+@app.post("/v1/responses")
+async def responses(req: Request):
+    """OpenAI Responses API — zweiter Endpunkt auf derselben Pipeline.
+
+    Zustandslos: kein store/previous_response_id. Der Request wird auf OpenAI-messages gemappt
+    und läuft danach durch exakt denselben Prompt-Bau wie /v1/chat/completions.
+    """
+    _require_auth(req)
+
+    st = await auth_status()
+    if not st.get("loggedIn"):
+        raise HTTPException(status_code=503, detail={"error": {
+            "message": "Claude CLI is not authenticated.",
+            "type": "server_error", "code": "not_authenticated"}})
+
+    body = await req.json()
+    try:
+        messages = rsp.input_to_messages(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": str(e), "type": "invalid_request_error"}}) from None
+    if not messages:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "'input' must not be empty", "type": "invalid_request_error"}})
+
+    req_model = body.get("model") or settings.default_model
+    base_model, effort_from_name = split_model_effort(req_model)
+    cli_model = map_model(base_model)
+    effort = effort_from_name or map_effort(body)
+    stream = bool(body.get("stream"))
+
+    prompt = messages_to_prompt(messages)
+    mcp_tools = openai_tools_to_mcp(rsp.tools_to_openai(body.get("tools")))
+    stats = {}
+    rid = rsp.new_id("resp")
+    echo = {"tools": body.get("tools") or [], "tool_choice": body.get("tool_choice", "auto")}
+
+    if stream:
+        return StreamingResponse(_responses_stream(rid, req_model, prompt, mcp_tools, cli_model,
+                                                   stats, effort, echo),
+                                 media_type="text/event-stream")
+
+    metrics.start()
+    t0 = time.perf_counter()
+    text_parts, tool_calls, result_text, err = [], None, None, None
+    async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
+        if kind == "delta":
+            text_parts.append(data)
+        elif kind == "tool_use":
+            tool_calls = tooluse_to_toolcalls(data)
+        elif kind == "result":
+            result_text = data
+        elif kind == "error":
+            err = data
+    _record(req_model, False, stats, (time.perf_counter() - t0) * 1000)
+
+    if err is not None:
+        code = 504 if err.get("type") == "timeout" else 502
+        return JSONResponse(status_code=code, content=rsp.envelope(
+            rid, req_model, [], status="failed", error={
+                "code": err.get("type", "api_error"), "message": err.get("message")},
+            **_rsp_ctx(stats, echo)))
+
+    output = ([rsp.function_call_item(tc) for tc in tool_calls] if tool_calls
+              else [rsp.message_item(result_text if result_text is not None else "".join(text_parts))])
+    status, incomplete = rsp.status_from_stop(stats.get("stop_reason"))
+    return JSONResponse(rsp.envelope(rid, req_model, output, status=status,
+                                     incomplete_details=incomplete, **_rsp_ctx(stats, echo)))
+
+
+_STATELESS = {"error": {
+    "message": ("Stored responses are not supported: this endpoint keeps no state, so there is "
+                "nothing to retrieve, cancel or delete. Every request must carry its full `input`."),
+    "type": "not_implemented"}}
+
+
+@app.get("/v1/responses/{response_id}")
+@app.delete("/v1/responses/{response_id}")
+async def responses_stateless_route(response_id: str):
+    """Ohne 501 käme hier ein 404 — das liest sich wie 'ID unbekannt' statt 'gibt es hier nicht'."""
+    return JSONResponse(status_code=501, content=_STATELESS)
+
+
+@app.post("/v1/responses/{response_id}/cancel")
+async def responses_cancel(response_id: str):
+    return JSONResponse(status_code=501, content=_STATELESS)
+
+
+def _rsp_ctx(stats, echo):
+    """Envelope-Felder, die aus Request-Kontext und Turn-Statistik kommen."""
+    return {"usage": stats.get("usage"), "thinking_tokens": stats.get("thinking_tokens", 0),
+            "cost": stats.get("cost_usd"), **echo}
+
+
+async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats, effort, echo):
+    """SSE im Responses-Event-Format. Reihenfolge: created -> in_progress -> Items -> completed."""
+    metrics.start()
+    t0 = time.perf_counter()
+    seq = [0]
+
+    def ev(name, payload):
+        seq[0] += 1
+        return "event: " + name + "\n" + _sse({"type": name, "sequence_number": seq[0], **payload})
+
+    try:
+        empty = rsp.envelope(rid, req_model, [], status="in_progress", **echo)
+        yield ev("response.created", {"response": empty})
+        yield ev("response.in_progress", {"response": empty})
+
+        idx = 0                                   # nächster freier output_index
+        think = rsp.ThinkingSummary(idx)
+        msg_id, msg_open, text_parts = rsp.new_id("msg"), False, []
+        output, done = [], False
+
+        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
+            if done:
+                continue
+            if kind == "thinking":
+                if settings.stream_thinking:
+                    for name, payload in think.update(data, time.perf_counter()):
+                        yield ev(name, payload)
+            elif kind == "delta":
+                if not data:
+                    continue
+                if not msg_open:                   # Denkphase abschließen, Text-Item eröffnen
+                    for name, payload in think.close():
+                        output.append(payload["item"])   # MUSS in output: completed ersetzt die Liste
+                        yield ev(name, payload)
+                    idx = 1 if think.opened else 0
+                    msg_open = True
+                    yield ev("response.output_item.added", {
+                        "output_index": idx,
+                        "item": {"type": "message", "id": msg_id, "role": "assistant",
+                                 "status": "in_progress", "content": []}})
+                    yield ev("response.content_part.added", {
+                        "output_index": idx, "item_id": msg_id, "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []}})
+                text_parts.append(data)
+                yield ev("response.output_text.delta", {
+                    "output_index": idx, "item_id": msg_id, "content_index": 0, "delta": data})
+            elif kind == "tool_use":
+                for name, payload in think.close():
+                    output.append(payload["item"])
+                    yield ev(name, payload)
+                base = 1 if think.opened else 0
+                for i, tc in enumerate(tooluse_to_toolcalls(data)):
+                    item = rsp.function_call_item(tc)
+                    at = base + i
+                    yield ev("response.output_item.added", {
+                        "output_index": at,
+                        "item": {**item, "arguments": "", "status": "in_progress"}})
+                    yield ev("response.function_call_arguments.delta", {
+                        "output_index": at, "item_id": item["id"], "delta": item["arguments"]})
+                    yield ev("response.function_call_arguments.done", {
+                        "output_index": at, "item_id": item["id"], "arguments": item["arguments"]})
+                    yield ev("response.output_item.done", {"output_index": at, "item": item})
+                    output.append(item)
+                done = True
+            elif kind == "result":
+                text = data if data else "".join(text_parts)
+                if not msg_open:                   # Antwort kam nur im result-Event
+                    for name, payload in think.close():
+                        output.append(payload["item"])
+                        yield ev(name, payload)
+                    idx = 1 if think.opened else 0
+                    yield ev("response.output_item.added", {
+                        "output_index": idx,
+                        "item": {"type": "message", "id": msg_id, "role": "assistant",
+                                 "status": "in_progress", "content": []}})
+                    yield ev("response.content_part.added", {
+                        "output_index": idx, "item_id": msg_id, "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []}})
+                    if text:
+                        yield ev("response.output_text.delta", {
+                            "output_index": idx, "item_id": msg_id, "content_index": 0,
+                            "delta": text})
+                item = rsp.message_item(text, msg_id)
+                yield ev("response.output_text.done", {
+                    "output_index": idx, "item_id": msg_id, "content_index": 0, "text": text})
+                yield ev("response.output_item.done", {"output_index": idx, "item": item})
+                output.append(item)
+                done = True
+            elif kind == "error":
+                log.error("responses stream error: %s", data)
+                yield ev("response.failed", {"response": rsp.envelope(
+                    rid, req_model, output, status="failed",
+                    error={"code": data.get("type", "api_error"),
+                           "message": data.get("message")}, **_rsp_ctx(stats, echo))})
+                return
+
+        status, incomplete = rsp.status_from_stop(stats.get("stop_reason"))
+        name = "response.incomplete" if status == "incomplete" else "response.completed"
+        yield ev(name, {"response": rsp.envelope(
+            rid, req_model, output, status=status, incomplete_details=incomplete,
+            **_rsp_ctx(stats, echo))})
+    finally:
+        _record(req_model, True, stats, (time.perf_counter() - t0) * 1000)

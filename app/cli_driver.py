@@ -128,7 +128,11 @@ def classify(m, stats, mark_ttft):
             if d.get("type") == "thinking_delta":
                 # KEIN mark_ttft(): ttft bleibt "erstes Text-Token", sonst sind die Latenz-
                 # Metriken nicht mehr mit früheren Läufen vergleichbar.
-                return ("thinking", d.get("estimated_tokens") or 0)
+                est = d.get("estimated_tokens") or 0
+                # Hier mitzählen (nicht erst im Endpunkt): so steht die Zahl beiden Endpunkten
+                # und auch dem Non-Streaming-Pfad zur Verfügung, unabhängig von STREAM_THINKING.
+                stats["thinking_tokens"] = stats.get("thinking_tokens", 0) + est
+                return ("thinking", est)
         return None
     if t == "assistant":
         blocks = (m.get("message") or {}).get("content") or []
