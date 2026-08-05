@@ -37,6 +37,9 @@ class Settings:
         # Daraus bauen wir eine Fortschrittszeile, sonst schweigt der Stream minutenlang.
         self.stream_thinking = _truthy(os.getenv("STREAM_THINKING", "1"))
         self.thinking_interval = float(os.getenv("THINKING_INTERVAL", "10"))  # s zwischen Updates
+        # /v1/responses aktualisiert die Zeile in place (summary_part.done ERSETZT), statt sie
+        # anzuhängen — dort ist ein kurzes Intervall sinnvoll statt einer Textwand.
+        self.thinking_interval_responses = float(os.getenv("THINKING_INTERVAL_RESPONSES", "1"))
         self.debug = _truthy(os.getenv("DEBUG", "0"))
         # CLI-stderr mitloggen (Default: an, wenn DEBUG).
         self.log_cli_stderr = _truthy(os.getenv("LOG_CLI_STDERR", "1" if self.debug else "0"))

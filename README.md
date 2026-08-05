@@ -3,7 +3,8 @@
 **An advanced wrapper that exposes the Claude Code CLI as an OpenAI-compatible REST API** —
 driven by your **Pro/Max subscription** instead of separate API credits.
 
-Endpoints: `/v1/chat/completions` (streaming + non-streaming), `/v1/models`, plus `/healthz` and `/metrics`.
+Endpoints: `/v1/chat/completions` and `/v1/responses` (both streaming + non-streaming), `/v1/models`,
+plus `/healthz` and `/metrics`.
 Design, rationale and the empirical findings live in [KONZEPT.md](KONZEPT.md).
 
 ## Why "advanced"?
@@ -50,6 +51,44 @@ genuine drop-in OpenAI backend:
   part of the session instead of an invisible side effect.
 - The request's tools are declared as **real MCP tools** → Claude emits a **native** `tool_use`. Our MCP server **stalls** on the call, we read the call from the stream and return it as OpenAI `tool_calls` (the **client** executes the tool).
 - Process model: a **reuse pool** keeps warm CLI processes alive and recycles them via `/clear` (bucketed by model + toolset). It falls back to one-shot when disabled (`POOL_ENABLED=0`).
+
+## The Responses API (`/v1/responses`)
+
+The OpenAI Responses API is supported **in addition to** Chat Completions — same pipeline, same
+prompt building, so history flattening, images, tool capture and prompt caching behave identically.
+Point a client at it by setting that connection's API type to `responses` (Open WebUI: *Connections
+→ API type*); it then POSTs to `<base-url>/responses`.
+
+What it buys over Chat Completions: reasoning is its own typed output item, so the thinking progress
+lives in `summary` where it belongs instead of in the same field other models use for real reasoning
+text — and clients **replace** that summary part rather than appending it, so the line updates in
+place (hence the much shorter `THINKING_INTERVAL_RESPONSES`).
+
+Supported: `input` as a string or as items (`message` with `input_text`/`output_text`/`input_image`,
+`function_call`, `function_call_output`), `instructions`, `tools` in the flat Responses form,
+`stream`, and the `model` suffix / `reasoning.effort` for effort control. Streaming emits
+`response.created → in_progress → output_item.added/done → completed`, with
+`response.output_text.delta`, `response.function_call_arguments.delta/done` and
+`response.reasoning_summary_part.added/done`.
+
+`usage` carries `output_tokens_details.reasoning_tokens` — the summed `estimated_tokens` from the
+CLI's thinking events, capped at `output_tokens` because it is an estimate, not a billed figure.
+The chat endpoint reports the same under `completion_tokens_details.reasoning_tokens`. A truncated
+answer comes back as `status: "incomplete"` with `incomplete_details`, mirroring
+`finish_reason: "length"` on the chat side.
+
+**Deliberately not supported: server-side state.** `previous_response_id` is rejected with a 400 —
+silently ignoring it would answer with half the conversation missing, which surfaces as a wrong
+answer rather than an error. `store` is accepted and ignored, since we never persist anything.
+Open WebUI is stateless by default (`ENABLE_RESPONSES_API_STATEFUL=False`), so this needs no
+configuration. `store` is accepted and ignored, `background: true` is rejected (nothing would be
+stored to poll for), and `GET`/`DELETE /v1/responses/{id}` plus `/cancel` answer **501** rather than
+a 404 that would read like "unknown id". Built-in server-side tools (`web_search`, `file_search`, …)
+are dropped: they would run inside OpenAI's infrastructure, which we are not.
+
+Not implemented: structured outputs (`text.format`) — the CLI cannot enforce a JSON schema, and
+faking it in the prompt would promise a guarantee we cannot keep. `max_output_tokens`, `temperature`
+and `top_p` are ignored, exactly as on the chat endpoint, because the CLI exposes no such knobs.
 
 ## Requirements
 
