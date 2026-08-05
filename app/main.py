@@ -1,4 +1,5 @@
 """OpenAI-kompatibler FastAPI-Endpoint auf Basis der Claude Code CLI."""
+import asyncio
 import hmac
 import json
 import logging
@@ -51,7 +52,7 @@ async def lifespan(app: FastAPI):
         await pool.shutdown()
 
 
-app = FastAPI(title="claude-wrapper-advanced", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="claude-wrapper-advanced", version="1.3.0", lifespan=lifespan)
 
 _ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -225,6 +226,9 @@ async def chat_completions(req: Request):
                                 "created": int(time.time()), "model": req_model,
                                 "choices": [], "usage": _usage_out(stats)})
                 yield "data: [DONE]\n\n"
+            except (asyncio.CancelledError, GeneratorExit):
+                stats["outcome"] = "cancelled"    # weggeklickter Chat ist kein Serverfehler
+                raise
             finally:
                 _record(req_model, True, stats, (time.perf_counter() - t0) * 1000)
 
@@ -234,6 +238,8 @@ async def chat_completions(req: Request):
     metrics.start()
     t0 = time.perf_counter()
     text_parts, tool_calls, result_text, err = [], None, None, None
+    # _record MUSS ins finally: bricht der Client ab (OpenWebUI-Hintergrundtasks tun das
+    # regelmäßig), fliegt ein CancelledError daran vorbei und inflight bliebe für immer erhöht.
     try:
         # Generator VOLL konsumieren (nicht break) -> Pool kann die Instanz sauber draina/zurückgeben.
         async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
@@ -247,12 +253,13 @@ async def chat_completions(req: Request):
                 err = data
     except FileNotFoundError:
         stats["outcome"] = "error"
-        _record(req_model, False, stats, (time.perf_counter() - t0) * 1000)
         raise HTTPException(status_code=502, detail={"error": {
             "message": f"Claude CLI '{settings.claude_bin}' nicht gefunden", "type": "api_error"}})
-
-    total_ms = (time.perf_counter() - t0) * 1000
-    _record(req_model, False, stats, total_ms)
+    except asyncio.CancelledError:
+        stats["outcome"] = "cancelled"
+        raise
+    finally:
+        _record(req_model, False, stats, (time.perf_counter() - t0) * 1000)
 
     if err is not None:
         code = 504 if err.get("type") == "timeout" else 502
@@ -323,16 +330,21 @@ async def responses(req: Request):
     metrics.start()
     t0 = time.perf_counter()
     text_parts, tool_calls, result_text, err = [], None, None, None
-    async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
-        if kind == "delta":
-            text_parts.append(data)
-        elif kind == "tool_use":
-            tool_calls = tooluse_to_toolcalls(data)
-        elif kind == "result":
-            result_text = data
-        elif kind == "error":
-            err = data
-    _record(req_model, False, stats, (time.perf_counter() - t0) * 1000)
+    try:
+        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
+            if kind == "delta":
+                text_parts.append(data)
+            elif kind == "tool_use":
+                tool_calls = tooluse_to_toolcalls(data)
+            elif kind == "result":
+                result_text = data
+            elif kind == "error":
+                err = data
+    except asyncio.CancelledError:
+        stats["outcome"] = "cancelled"
+        raise
+    finally:
+        _record(req_model, False, stats, (time.perf_counter() - t0) * 1000)
 
     if err is not None:
         code = 504 if err.get("type") == "timeout" else 502
@@ -473,5 +485,8 @@ async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats,
         yield ev(name, {"response": rsp.envelope(
             rid, req_model, output, status=status, incomplete_details=incomplete,
             **_rsp_ctx(stats, echo))})
+    except (asyncio.CancelledError, GeneratorExit):
+        stats["outcome"] = "cancelled"
+        raise
     finally:
         _record(req_model, True, stats, (time.perf_counter() - t0) * 1000)
