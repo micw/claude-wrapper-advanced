@@ -21,6 +21,10 @@ genuine drop-in OpenAI backend:
 - **Prompt-cache aware** — a stable tool/system prefix yields high cache-hit rates (tracked live at `/metrics`).
 - **Vision** — inline OpenAI `image_url` parts (base64 data URI) become native image blocks, so
   pasting a screenshot in Open WebUI & Co. just works, in the current turn and in history.
+- **Visible thinking progress** — opus at high effort can reason for minutes before the first
+  token. We stream `reasoning_content` lines (`Thinking… · 2.9k tokens`) so the client shows
+  progress instead of a dead connection. The CLI redacts the reasoning *text*, so this is a
+  progress indicator built from `estimated_tokens`, never invented reasoning.
 - **Per-request effort control** — OpenAI `reasoning_effort`, OpenRouter `reasoning.effort`, or a
   model-name suffix like `opus:max` (the model picker doubles as an effort selector).
 - **Real usage & cost** — OpenAI `usage` plus an OpenRouter-style `cost`, with cache read/write token stats.
@@ -182,8 +186,15 @@ Always run the curl quick test before testing in the editor.
 ## Known limitations (details in KONZEPT.md)
 
 - **No parallel `tool_calls`** (max. 1 tool call per response; multi-tool is sequential).
-- **No reasoning/thinking text** (the CLI does not emit it).
+- **No reasoning/thinking *text*.** The CLI emits `thinking_delta` events while the model reasons,
+  but they are redacted — `{"thinking": "", "estimated_tokens": 150}`. We forward the progress line
+  described above, never the reasoning itself, because there is none to forward.
+  `cli.thinking_is_redacted` fails the day this changes.
 - Latency is inference-dominated (~3s/turn; one tool round-trip = 2 turns).
+- **Timeouts are idle-based, not wall-clock.** A turn is aborted after `IDLE_TIMEOUT` seconds of
+  *silence*, not after a fixed total duration — a total deadline kills long but healthy turns
+  (production: first token at 164.9s, killed by the old 180s cap at 180s). `REQUEST_TIMEOUT` is
+  just a backstop. Raise `IDLE_TIMEOUT` only if `cli.streams_continuously` reports gaps near it.
 - Per-request `cost` in `usage` is distorted for tool-call turns (cumulative cost is correct); see the pool notes in the code.
 
 ## Assumption tests

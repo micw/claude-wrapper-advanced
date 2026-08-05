@@ -604,6 +604,78 @@ async def c_image_dropped(ctx):
             else OK(f"turn completed, image dropped with a note: {str(ev.get('result'))[:40]!r}"))
 
 
+@check("cli.streams_continuously", 2, "CLI never goes silent mid-turn (the basis for IDLE_TIMEOUT)")
+async def c_streams(ctx):
+    """Our timeout is an idle window, not a total deadline — that only holds if the CLI keeps
+    emitting while it works. It does: thinking_deltas flow while the model reasons (they carry
+    no text, only estimated_tokens, but they keep the stream alive). Measured worst case is the
+    prefill gap: ~10s at 1MB of context, <2s otherwise.
+    """
+    async with CLI(model="opus", extra=["--effort", "xhigh"]) as cli:
+        await cli.send("Prove rigorously whether 1729 is the smallest number expressible as a sum "
+                       "of two positive cubes in two different ways. Verify alternatives carefully.")
+        loop = asyncio.get_event_loop()
+        last, maxgap, kinds = loop.time(), 0.0, set()
+        while True:
+            try:
+                raw = await asyncio.wait_for(cli.proc.stdout.readline(), timeout=180)
+            except asyncio.TimeoutError:
+                return FAIL("no line for 180s")
+            if not raw:
+                return FAIL("stream ended without a result")
+            now = loop.time()
+            maxgap = max(maxgap, now - last)
+            last = now
+            try:
+                m = json.loads(raw)
+            except Exception:
+                continue
+            d = ((m.get("event") or {}).get("delta") or {})
+            if d.get("type"):
+                kinds.add(d["type"])
+            if m.get("type") == "result":
+                break
+    ctx["max_gap_s"] = maxgap
+    thinking = "thinking_delta" in kinds
+    if maxgap > settings.idle_timeout / 2:
+        return FAIL(f"largest silence {maxgap:.1f}s — too close to IDLE_TIMEOUT="
+                    f"{settings.idle_timeout:.0f}s, raise it")
+    return OK(f"largest silence {maxgap:.1f}s (IDLE_TIMEOUT={settings.idle_timeout:.0f}s), "
+              f"thinking_delta={'yes' if thinking else 'no'}")
+
+
+@check("cli.thinking_is_redacted", 2, "thinking_deltas carry NO text (why we cannot forward reasoning)")
+async def c_thinking(ctx):
+    """If this ever starts carrying text, we can forward it as reasoning_content and the long
+    silent wait before the first token becomes visible to the user."""
+    async with CLI(model="opus", extra=["--effort", "xhigh"]) as cli:
+        await cli.send("Think hard, then answer: is 8191 prime? Verify by trial division.")
+        seen, texty = 0, False
+        while seen < 5:
+            try:
+                raw = await asyncio.wait_for(cli.proc.stdout.readline(), timeout=180)
+            except asyncio.TimeoutError:
+                break
+            if not raw:
+                break
+            try:
+                m = json.loads(raw)
+            except Exception:
+                continue
+            d = ((m.get("event") or {}).get("delta") or {})
+            if d.get("type") == "thinking_delta":
+                seen += 1
+                if (d.get("thinking") or "").strip():
+                    texty = True
+            if m.get("type") == "result":
+                break
+    if not seen:
+        return SKIP("no thinking_delta observed in this turn")
+    return (FAIL(f"thinking now carries text ({seen} deltas) — reasoning_content is possible, "
+                 "revisit the README limitation") if texty
+            else OK(f"{seen} thinking_deltas, all empty (progress signal only)"))
+
+
 MANUAL = [
     ("model.opus_1m", "opus gives 1M context — needs a >200k prompt (expensive), check manually"),
     ("prompt.dynamic_sections", "default system prompt contains cwd/git/env/memory — check via capture proxy"),

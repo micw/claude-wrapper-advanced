@@ -195,6 +195,36 @@ def messages_to_prompt(messages):
     return blocks
 
 
+class ThinkingProgress:
+    """thinking_delta-Events -> gedrosselte Fortschrittszeile für reasoning_content.
+
+    Die CLI redigiert den Denktext (`thinking` ist leer) und liefert nur `estimated_tokens` pro
+    Event — als INKREMENT, nicht kumulativ (gemessen: 50, 200, 150, 150, 250, … über 18 Events).
+    Wir summieren und zeigen den Stand; ohne das schweigt der Stream bei opus/xhigh minutenlang.
+
+    Clients hängen reasoning-Deltas an (statt sie in place zu ersetzen), deshalb pro Update EINE
+    Zeile und nur alle `thinking_interval` Sekunden.
+    """
+
+    def __init__(self, interval=None):
+        self.tokens = 0
+        self.last = None
+        self.interval = settings.thinking_interval if interval is None else interval
+
+    @staticmethod
+    def _fmt(n):
+        return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+    def update(self, est_tokens, now):
+        """Fortschritt verbuchen. Gibt die anzuzeigende Zeile zurück — oder None (gedrosselt)."""
+        self.tokens += est_tokens or 0
+        if self.last is not None and now - self.last < self.interval:
+            return None
+        prefix = "" if self.last is None else "\n"
+        self.last = now
+        return f"{prefix}Thinking… · {self._fmt(self.tokens)} tokens"
+
+
 def openai_tools_to_mcp(tools):
     """OpenAI tools[] -> MCP tools/list-Format."""
     out = []

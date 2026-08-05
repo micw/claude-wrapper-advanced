@@ -10,6 +10,7 @@ import struct
 
 from app.config import settings
 from app.translate import (
+    ThinkingProgress,
     finish_from_stop,
     map_effort,
     map_model,
@@ -207,6 +208,42 @@ class TestImagesRejected(Base):
         out = messages_to_prompt([{"role": "user", "content": [img_part()] * 4}])
         self.assertEqual(len(images(out)), 2)
         self.assertIn("more than 2 images", "".join(texts(out)))
+
+
+class TestThinkingProgress(unittest.TestCase):
+    """estimated_tokens are INCREMENTS per event (measured: 50, 200, 150, 150, 250, …)."""
+
+    def test_first_update_emits_immediately(self):
+        p = ThinkingProgress(interval=2)
+        self.assertEqual(p.update(50, 0.0), "Thinking… · 50 tokens")
+
+    def test_tokens_accumulate_across_events(self):
+        p = ThinkingProgress(interval=0)
+        p.update(50, 0.0)
+        self.assertEqual(p.update(200, 1.0), "\nThinking… · 250 tokens")
+        self.assertEqual(p.update(150, 2.0), "\nThinking… · 400 tokens")
+
+    def test_updates_are_throttled_but_still_counted(self):
+        p = ThinkingProgress(interval=2)
+        p.update(100, 0.0)
+        self.assertIsNone(p.update(100, 0.5), "within the interval -> no line")
+        self.assertIsNone(p.update(100, 1.9))
+        self.assertEqual(p.update(100, 2.1), "\nThinking… · 400 tokens",
+                         "throttled events must not be lost from the total")
+
+    def test_thousands_are_abbreviated(self):
+        p = ThinkingProgress(interval=0)
+        p.update(2850, 0.0)
+        self.assertEqual(p.update(0, 1.0), "\nThinking… · 2.9k tokens")
+
+    def test_only_the_first_line_has_no_newline(self):
+        p = ThinkingProgress(interval=0)
+        self.assertFalse(p.update(10, 0.0).startswith("\n"))
+        self.assertTrue(p.update(10, 1.0).startswith("\n"))
+
+    def test_missing_estimate_does_not_crash(self):
+        p = ThinkingProgress(interval=0)
+        self.assertEqual(p.update(None, 0.0), "Thinking… · 0 tokens")
 
 
 class TestPureHelpers(unittest.TestCase):
