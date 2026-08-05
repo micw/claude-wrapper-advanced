@@ -3,7 +3,11 @@
 The endpoint deliberately reuses messages_to_prompt(), so these tests only cover the mapping
 into (and out of) that shared path.
 """
+import json
 import unittest
+from unittest import mock
+
+from app import main
 
 from app.config import settings
 from app.responses import (
@@ -245,6 +249,83 @@ class TestThinkingSummary(unittest.TestCase):
     def test_default_interval_comes_from_its_own_setting(self):
         """Separate from the chat endpoint: replacing in place tolerates a short interval."""
         self.assertEqual(ThinkingSummary(0).interval, settings.thinking_interval_responses)
+
+
+class TestStreamComposition(unittest.IsolatedAsyncioTestCase):
+    """The event stream as a whole — this is where the mixed-turn bugs lived.
+
+    Claude often announces a tool call before making it, so thinking + text + tool_use land in
+    ONE turn. That combination duplicated the reasoning item (close() ran twice) and dropped the
+    announcement text (its index collided and it never reached the final envelope, which
+    response.completed uses to replace everything the client had accumulated).
+    """
+
+    async def _events(self, turn):
+        async def fake_drive(prompt, mcp_tools, model, stats, effort):
+            for kind, data in turn:
+                yield kind, data
+
+        with mock.patch.object(main, "drive_turn", fake_drive):
+            chunks = [c async for c in main._responses_stream(
+                "resp_1", "sonnet", "prompt", [], "sonnet", {}, None,
+                {"tools": [], "tool_choice": "auto"})]
+        return [json.loads(line[6:]) for c in chunks for line in c.splitlines()
+                if line.startswith("data: ")]
+
+    @staticmethod
+    def _done(evs):
+        return [(e["output_index"], e["item"]["type"])
+                for e in evs if e["type"] == "response.output_item.done"]
+
+    @staticmethod
+    def _final(evs):
+        return [e for e in evs if e["type"] == "response.completed"][0]["response"]["output"]
+
+    TOOL = [{"name": "mcp__t__get_weather", "input": {"city": "Berlin"}}]
+
+    async def test_thinking_text_and_tool_in_one_turn(self):
+        evs = await self._events([("thinking", 700), ("delta", "Ich schaue nach. "),
+                                  ("tool_use", self.TOOL)])
+        self.assertEqual(self._done(evs), [(0, "reasoning"), (1, "message"), (2, "function_call")],
+                         "one reasoning item, and every item on its own index")
+        final = self._final(evs)
+        self.assertEqual([i["type"] for i in final], ["reasoning", "message", "function_call"])
+        msg = [i for i in final if i["type"] == "message"][0]
+        self.assertEqual(msg["content"][0]["text"], "Ich schaue nach. ",
+                         "the announcement must survive into the envelope")
+
+    async def test_thinking_then_tool_without_text(self):
+        evs = await self._events([("thinking", 700), ("tool_use", self.TOOL)])
+        self.assertEqual(self._done(evs), [(0, "reasoning"), (1, "function_call")])
+        self.assertEqual([i["type"] for i in self._final(evs)], ["reasoning", "function_call"])
+
+    async def test_thinking_then_plain_answer(self):
+        evs = await self._events([("thinking", 700), ("delta", "Hallo"), ("result", "Hallo")])
+        self.assertEqual(self._done(evs), [(0, "reasoning"), (1, "message")])
+        self.assertEqual([i["type"] for i in self._final(evs)], ["reasoning", "message"])
+
+    async def test_answer_without_any_thinking_starts_at_index_zero(self):
+        evs = await self._events([("delta", "Hallo"), ("result", "Hallo")])
+        self.assertEqual(self._done(evs), [(0, "message")])
+        self.assertEqual([i["type"] for i in self._final(evs)], ["message"])
+
+    async def test_reasoning_item_appears_exactly_once(self):
+        """close() is reached from the text branch AND the tool branch."""
+        evs = await self._events([("thinking", 700), ("delta", "x"), ("tool_use", self.TOOL)])
+        reasoning = [e for e in evs if e["type"] == "response.output_item.done"
+                     and e["item"]["type"] == "reasoning"]
+        self.assertEqual(len(reasoning), 1)
+        self.assertEqual(sum(1 for i in self._final(evs) if i["type"] == "reasoning"), 1)
+
+    async def test_terminal_event_is_always_completed(self):
+        evs = await self._events([("delta", "x"), ("result", "x")])
+        self.assertEqual(evs[-1]["type"], "response.completed")
+
+    async def test_sequence_numbers_are_strictly_increasing(self):
+        evs = await self._events([("thinking", 700), ("delta", "x"), ("result", "x")])
+        seqs = [e["sequence_number"] for e in evs]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(len(seqs), len(set(seqs)))
 
 
 if __name__ == "__main__":

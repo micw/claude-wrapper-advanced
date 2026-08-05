@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
         await pool.shutdown()
 
 
-app = FastAPI(title="claude-wrapper-advanced", version="1.3.1", lifespan=lifespan)
+app = FastAPI(title="claude-wrapper-advanced", version="1.3.2", lifespan=lifespan)
 
 _ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -399,9 +399,11 @@ async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats,
         yield ev("response.created", {"response": empty})
         yield ev("response.in_progress", {"response": empty})
 
-        idx = 0                                   # nächster freier output_index
-        think = rsp.ThinkingSummary(idx)
-        msg_id, msg_open, text_parts = rsp.new_id("msg"), False, []
+        # Index IMMER aus len(output) ableiten statt zu rechnen: Denkphase, Text und Tool-Calls
+        # können in EINEM Turn gemischt auftreten (Claude kündigt den Tool-Aufruf gern an), und
+        # eine Kollision würde ein Item überschreiben.
+        think = rsp.ThinkingSummary(0)
+        msg_id, msg_idx, text_parts = rsp.new_id("msg"), None, []
         output, done = [], False
 
         async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
@@ -411,33 +413,34 @@ async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats,
                 if settings.stream_thinking:
                     for name, payload in think.update(data, time.perf_counter()):
                         yield ev(name, payload)
-            elif kind == "delta":
+                continue
+
+            # Jedes andere Event beendet die Denkphase — close() ist idempotent, sonst käme das
+            # reasoning-Item bei Text UND Tool-Call im selben Turn doppelt in die Liste.
+            for name, payload in think.close():
+                output.append(payload["item"])       # MUSS in output: completed ersetzt die Liste
+                yield ev(name, payload)
+
+            if kind == "delta":
                 if not data:
                     continue
-                if not msg_open:                   # Denkphase abschließen, Text-Item eröffnen
-                    for name, payload in think.close():
-                        output.append(payload["item"])   # MUSS in output: completed ersetzt die Liste
+                if msg_idx is None:
+                    msg_idx = len(output)
+                    for name, payload in rsp.message_open_events(msg_id, msg_idx):
                         yield ev(name, payload)
-                    idx = 1 if think.opened else 0
-                    msg_open = True
-                    yield ev("response.output_item.added", {
-                        "output_index": idx,
-                        "item": {"type": "message", "id": msg_id, "role": "assistant",
-                                 "status": "in_progress", "content": []}})
-                    yield ev("response.content_part.added", {
-                        "output_index": idx, "item_id": msg_id, "content_index": 0,
-                        "part": {"type": "output_text", "text": "", "annotations": []}})
                 text_parts.append(data)
                 yield ev("response.output_text.delta", {
-                    "output_index": idx, "item_id": msg_id, "content_index": 0, "delta": data})
+                    "output_index": msg_idx, "item_id": msg_id, "content_index": 0, "delta": data})
             elif kind == "tool_use":
-                for name, payload in think.close():
-                    output.append(payload["item"])
-                    yield ev(name, payload)
-                base = 1 if think.opened else 0
-                for i, tc in enumerate(tooluse_to_toolcalls(data)):
+                if msg_idx is not None:              # angefangenen Text ZUERST abschließen, sonst
+                    text = "".join(text_parts)       # fehlt er im Envelope und der Client wirft
+                    for name, payload in rsp.message_close_events(msg_id, msg_idx, text):
+                        yield ev(name, payload)      # das bereits Gestreamte wieder weg
+                    output.append(rsp.message_item(text, msg_id))
+                    msg_idx = None
+                for tc in tooluse_to_toolcalls(data):
                     item = rsp.function_call_item(tc)
-                    at = base + i
+                    at = len(output)
                     yield ev("response.output_item.added", {
                         "output_index": at,
                         "item": {**item, "arguments": "", "status": "in_progress"}})
@@ -450,27 +453,17 @@ async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats,
                 done = True
             elif kind == "result":
                 text = data if data else "".join(text_parts)
-                if not msg_open:                   # Antwort kam nur im result-Event
-                    for name, payload in think.close():
-                        output.append(payload["item"])
+                if msg_idx is None:                  # Antwort kam nur im result-Event
+                    msg_idx = len(output)
+                    for name, payload in rsp.message_open_events(msg_id, msg_idx):
                         yield ev(name, payload)
-                    idx = 1 if think.opened else 0
-                    yield ev("response.output_item.added", {
-                        "output_index": idx,
-                        "item": {"type": "message", "id": msg_id, "role": "assistant",
-                                 "status": "in_progress", "content": []}})
-                    yield ev("response.content_part.added", {
-                        "output_index": idx, "item_id": msg_id, "content_index": 0,
-                        "part": {"type": "output_text", "text": "", "annotations": []}})
                     if text:
                         yield ev("response.output_text.delta", {
-                            "output_index": idx, "item_id": msg_id, "content_index": 0,
+                            "output_index": msg_idx, "item_id": msg_id, "content_index": 0,
                             "delta": text})
-                item = rsp.message_item(text, msg_id)
-                yield ev("response.output_text.done", {
-                    "output_index": idx, "item_id": msg_id, "content_index": 0, "text": text})
-                yield ev("response.output_item.done", {"output_index": idx, "item": item})
-                output.append(item)
+                for name, payload in rsp.message_close_events(msg_id, msg_idx, text):
+                    yield ev(name, payload)
+                output.append(rsp.message_item(text, msg_id))
                 done = True
             elif kind == "error":
                 log.error("responses stream error: %s", data)
