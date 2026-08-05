@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
         await pool.shutdown()
 
 
-app = FastAPI(title="claude-wrapper-advanced", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="claude-wrapper-advanced", version="1.3.1", lifespan=lifespan)
 
 _ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -480,9 +480,13 @@ async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats,
                            "message": data.get("message")}, **_rsp_ctx(stats, echo))})
                 return
 
+        # IMMER response.completed als Terminal-Event, auch bei status "incomplete". Die Spec
+        # sähe response.incomplete vor, aber Clients werten es nicht aus: gegen OpenWebUIs echten
+        # Handler geprüft, response.incomplete liefert meta=None -> usage UND das done-Signal
+        # gehen verloren, die Antwort bliebe als unfertig hängen. Der Status steht im Envelope,
+        # ein spec-kundiger Client findet ihn dort.
         status, incomplete = rsp.status_from_stop(stats.get("stop_reason"))
-        name = "response.incomplete" if status == "incomplete" else "response.completed"
-        yield ev(name, {"response": rsp.envelope(
+        yield ev("response.completed", {"response": rsp.envelope(
             rid, req_model, output, status=status, incomplete_details=incomplete,
             **_rsp_ctx(stats, echo))})
     except (asyncio.CancelledError, GeneratorExit):
