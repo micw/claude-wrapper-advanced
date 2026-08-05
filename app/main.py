@@ -15,6 +15,7 @@ from .cli_driver import drive_turn
 from .metrics import metrics
 from .translate import (
     EFFORT_LEVELS,
+    ThinkingProgress,
     finish_from_stop,
     map_effort,
     map_model,
@@ -49,7 +50,7 @@ async def lifespan(app: FastAPI):
         await pool.shutdown()
 
 
-app = FastAPI(title="claude-wrapper-advanced", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="claude-wrapper-advanced", version="1.2.0", lifespan=lifespan)
 
 _ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -183,6 +184,7 @@ async def chat_completions(req: Request):
             try:
                 yield _sse(_chunk(cid, req_model, {"role": "assistant", "content": ""}))
                 done = False
+                think = ThinkingProgress()
                 # Generator VOLL konsumieren (nicht break), damit der Pool die Instanz
                 # sauber draint/zurückgibt; nach dem Terminal-Event kommt nichts mehr.
                 async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
@@ -191,6 +193,13 @@ async def chat_completions(req: Request):
                     if kind == "delta":
                         if data:
                             yield _sse(_chunk(cid, req_model, {"content": data}))
+                    elif kind == "thinking":
+                        # Fortschritt statt Denktext (die CLI redigiert ihn). Clients lesen
+                        # reasoning_content (OpenWebUI: reasoning_content > reasoning > thinking).
+                        if settings.stream_thinking:
+                            line = think.update(data, time.perf_counter())
+                            if line:
+                                yield _sse(_chunk(cid, req_model, {"reasoning_content": line}))
                     elif kind == "tool_use":
                         tcs = tooluse_to_toolcalls(data)
                         yield _sse(_chunk(cid, req_model,

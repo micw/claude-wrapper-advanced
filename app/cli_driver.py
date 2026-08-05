@@ -125,6 +125,10 @@ def classify(m, stats, mark_ttft):
             if d.get("type") == "text_delta" and d.get("text"):
                 mark_ttft()
                 return ("delta", d["text"])
+            if d.get("type") == "thinking_delta":
+                # KEIN mark_ttft(): ttft bleibt "erstes Text-Token", sonst sind die Latenz-
+                # Metriken nicht mehr mit früheren Läufen vergleichbar.
+                return ("thinking", d.get("estimated_tokens") or 0)
         return None
     if t == "assistant":
         blocks = (m.get("message") or {}).get("content") or []
@@ -150,9 +154,34 @@ def classify(m, stats, mark_ttft):
     return None
 
 
-def _timeout_evt():
-    return ("error", {"type": "timeout",
-                      "message": f"CLI timeout after {settings.request_timeout:.0f}s"})
+class Silent(asyncio.TimeoutError):
+    """Stille > idle_timeout — im Gegensatz zum Erreichen des Gesamt-Deckels."""
+
+
+async def read_line(stdout, hard_deadline, loop):
+    """Nächste Stream-Zeile lesen. Silent bei Stille, TimeoutError am Gesamt-Deckel.
+
+    Idle statt Gesamtfrist: eine laufende Antwort darf dauern (opus/xhigh denkt minutenlang und
+    schickt dabei nur inhaltsleere thinking_deltas), ein hängender Prozess fällt trotzdem nach
+    idle_timeout auf — schneller als die alte 180s-Gesamtfrist, die stattdessen ARBEITENDE
+    Turns abgeschnitten hat.
+    """
+    remaining = hard_deadline - loop.time()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    try:
+        return await asyncio.wait_for(stdout.readline(),
+                                      timeout=min(settings.idle_timeout, remaining))
+    except asyncio.TimeoutError:
+        if loop.time() >= hard_deadline:
+            raise
+        raise Silent from None
+
+
+def _timeout_evt(silent=True):
+    msg = (f"CLI sent nothing for {settings.idle_timeout:.0f}s" if silent
+           else f"CLI turn exceeded {settings.request_timeout:.0f}s")
+    return ("error", {"type": "timeout", "message": msg})
 
 
 async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None):
@@ -196,16 +225,11 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None):
     deadline = loop.time() + settings.request_timeout
     try:
         while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                stats["outcome"] = "timeout"
-                yield _timeout_evt()
-                return
             try:
-                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
-            except asyncio.TimeoutError:
+                raw = await read_line(proc.stdout, deadline, loop)
+            except asyncio.TimeoutError as e:
                 stats["outcome"] = "timeout"
-                yield _timeout_evt()
+                yield _timeout_evt(isinstance(e, Silent))
                 return
             if not raw:
                 break  # EOF

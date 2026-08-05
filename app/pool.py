@@ -14,7 +14,7 @@ import time
 from collections import defaultdict, deque
 
 from .config import settings
-from .cli_driver import _build_args, child_env, classify
+from .cli_driver import _build_args, _timeout_evt, Silent, child_env, classify, read_line
 
 log = logging.getLogger("pool")
 
@@ -60,8 +60,10 @@ class Proc:
         )
         self._err_task = asyncio.create_task(self._drain_err())
         # Warm-up: /clear löst die CLI-Init aus (token-frei) und macht die Instanz nutzbar.
+        # clear_timeout, NICHT request_timeout: das ist eine Sofort-Operation (~0.8s inkl. Init) —
+        # am Gesamt-Deckel zu hängen hieße, minutenlang auf eine tote Instanz zu warten.
         await self._send(_clear_msg())
-        await self._await_result(settings.request_timeout)
+        await self._await_result(settings.clear_timeout)
 
     async def _drain_err(self):
         with contextlib.suppress(Exception):
@@ -76,7 +78,11 @@ class Proc:
             await self.proc.stdin.drain()
 
     async def _await_result(self, timeout):
-        """Liest bis zum nächsten result-Event; verwirft alles davor."""
+        """Liest bis zum nächsten result-Event; verwirft alles davor.
+
+        GESAMT-Timeout — bewusst, denn die Aufrufer sind Sofort-Operationen (/clear, Drain nach
+        Interrupt). Der Turn selbst nutzt die Idle-Semantik von read_line().
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while True:
@@ -128,19 +134,12 @@ class Proc:
         deadline = loop.time() + settings.request_timeout
         try:
             while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    self.dead = True
-                    stats["outcome"] = "timeout"
-                    yield ("error", {"type": "timeout",
-                                     "message": f"CLI timeout after {settings.request_timeout:.0f}s"})
-                    return
                 try:
-                    raw = await asyncio.wait_for(self.proc.stdout.readline(), timeout=remaining)
-                except asyncio.TimeoutError:
+                    raw = await read_line(self.proc.stdout, deadline, loop)
+                except asyncio.TimeoutError as e:
                     self.dead = True
                     stats["outcome"] = "timeout"
-                    yield ("error", {"type": "timeout", "message": "CLI timeout"})
+                    yield _timeout_evt(isinstance(e, Silent))
                     return
                 if not raw:
                     self.dead = True
@@ -157,8 +156,8 @@ class Proc:
                 if ev is None:
                     continue
                 kind = ev[0]
-                if kind == "delta":
-                    yield ev
+                if kind in ("delta", "thinking"):   # thinking MUSS hier rein — sonst fiele es
+                    yield ev                        # in den else-Zweig und würde den Turn beenden
                 elif kind == "tool_use":
                     # Turn abbrechen (Prozess bleibt am Leben), Client bekommt den Call sofort.
                     # Known limitation: total_cost_usd steht NUR im result-Event, nicht in der

@@ -15,7 +15,13 @@ class Settings:
         self.api_key = os.getenv("API_KEY") or None
         self.claude_bin = os.getenv("CLAUDE_BIN", "claude")
         self.default_model = os.getenv("DEFAULT_MODEL", "sonnet")
-        self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "180"))
+        # Zwei Uhren: die Idle-Schwelle ist die eigentliche Grenze (Stille zwischen zwei
+        # Stream-Zeilen), REQUEST_TIMEOUT nur noch die Reißleine für den Gesamt-Turn.
+        # Eine reine Gesamtfrist würde laufende Antworten abschneiden: opus/xhigh denkt
+        # minutenlang, und die CLI ist dabei selbst bei 1 MB Kontext nie länger als ~10 s
+        # still (Prefill; sonst < 2 s) — gemessen, siehe cli.streams_continuously.
+        self.idle_timeout = float(os.getenv("IDLE_TIMEOUT", "60"))
+        self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "1800"))
         # Perf-Hebel (opt-in). Leer = CLI-Default.
         self.effort = os.getenv("EFFORT") or None        # low | medium | high | xhigh | max
         self.system_prompt = os.getenv("SYSTEM_PROMPT") or None
@@ -26,6 +32,11 @@ class Settings:
                     self.system_prompt = f.read()
             except OSError:
                 pass
+        # Thinking-Fortschritt als reasoning_content mitstreamen. Die CLI liefert KEINEN Denktext
+        # (thinking ist leer, siehe cli.thinking_is_redacted) — nur estimated_tokens pro Event.
+        # Daraus bauen wir eine Fortschrittszeile, sonst schweigt der Stream minutenlang.
+        self.stream_thinking = _truthy(os.getenv("STREAM_THINKING", "1"))
+        self.thinking_interval = float(os.getenv("THINKING_INTERVAL", "10"))  # s zwischen Updates
         self.debug = _truthy(os.getenv("DEBUG", "0"))
         # CLI-stderr mitloggen (Default: an, wenn DEBUG).
         self.log_cli_stderr = _truthy(os.getenv("LOG_CLI_STDERR", "1" if self.debug else "0"))
