@@ -71,6 +71,11 @@ Supported: `input` as a string or as items (`message` with `input_text`/`output_
 `response.output_text.delta`, `response.function_call_arguments.delta/done` and
 `response.reasoning_summary_part.added/done`.
 
+The terminal event is always `response.completed`, even when the status inside it is
+`incomplete`. The spec would call for `response.incomplete`, but clients do not act on it — Open
+WebUI's handler returns no metadata for it, so `usage` and the done signal are lost and the message
+never finishes. The status and `incomplete_details` are in the envelope either way.
+
 `usage` carries `output_tokens_details.reasoning_tokens` — the summed `estimated_tokens` from the
 CLI's thinking events, capped at `output_tokens` because it is an estimate, not a billed figure.
 The chat endpoint reports the same under `completion_tokens_details.reasoning_tokens`. A truncated
