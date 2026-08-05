@@ -178,6 +178,30 @@ def envelope(rid, model, output, *, status="completed", usage=None, thinking_tok
     return obj
 
 
+def message_open_events(msg_id, index):
+    """Events, die ein Text-Item eröffnen."""
+    return [
+        ("response.output_item.added", {"output_index": index, "item": {
+            "type": "message", "id": msg_id, "role": "assistant",
+            "status": "in_progress", "content": []}}),
+        ("response.content_part.added", {
+            "output_index": index, "item_id": msg_id, "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []}}),
+    ]
+
+
+def message_close_events(msg_id, index, text):
+    """Events, die ein Text-Item abschließen. MUSS auch vor einem Tool-Call laufen, sonst fehlt
+    das Item im Envelope von response.completed — und der Client verwirft den bereits
+    gestreamten Text, weil completed die Output-Liste ersetzt."""
+    return [
+        ("response.output_text.done", {"output_index": index, "item_id": msg_id,
+                                       "content_index": 0, "text": text}),
+        ("response.output_item.done", {"output_index": index,
+                                       "item": message_item(text, msg_id)}),
+    ]
+
+
 class ThinkingSummary:
     """Fortschritt als reasoning-Item mit EINER summary-Part, die ersetzt wird.
 
@@ -193,6 +217,7 @@ class ThinkingSummary:
         self.tokens = 0
         self.last = None
         self.opened = False
+        self.closed = False
 
     @staticmethod
     def _fmt(n):
@@ -221,8 +246,11 @@ class ThinkingSummary:
             "output_index": self.output_index, "summary_index": 0, "part": self._part()})]
 
     def close(self):
-        if not self.opened:
+        """Idempotent — der Ablauf schließt die Denkphase an mehreren Stellen ab (Text, Tool,
+        Result). Ohne das Flag käme das reasoning-Item mehrfach in die Output-Liste."""
+        if not self.opened or self.closed:
             return []
+        self.closed = True
         return [("response.output_item.done", {
             "output_index": self.output_index,
             "item": {"type": "reasoning", "id": self.item_id, "status": "completed",
