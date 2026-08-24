@@ -151,8 +151,11 @@ def classify(m, stats, mark_ttft):
         _capture_result(m, stats)
         if m.get("is_error"):
             stats["outcome"] = "error"
+            # Achtung: 'subtype' steht auch im Fehlerfall auf "success" — nur is_error zählt.
+            # api_error_status trägt den echten Upstream-Status (z.B. 404 bei Modellfehlern).
             return ("error", {"type": "cli_error",
-                              "message": (m.get("result") or m.get("subtype") or "cli error")})
+                              "message": (m.get("result") or m.get("subtype") or "cli error"),
+                              "status": m.get("api_error_status")})
         stats["outcome"] = "final"
         return ("result", m.get("result") or "")
     return None

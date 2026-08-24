@@ -399,15 +399,30 @@ async def c_incr(ctx):
         FAIL(f"no incremental hit: turn2 read={r2} create={c2}")
 
 
-@check("model.aliases", 2, "Model aliases (opus/haiku) are accepted")
+@check("model.registry", 2, "Every model name we advertise in /v1/models is accepted by the CLI")
 async def c_models(ctx):
+    # Wir reichen nur volle Namen an die CLI (nie Aliase — die driften mit der CLI-Version).
+    # Ein CLI-Update, das einen Namen fallen lässt, muss hier auffallen und nicht im Betrieb.
     res = {}
-    for mdl in ("opus", "haiku"):
-        async with CLI(model=mdl) as cli:
+    for cli_model, _name, _ctx, _levels in settings.models.values():
+        async with CLI(model=cli_model) as cli:
             ev, _ = await cli.turn("Reply with exactly: OK")
-            res[mdl] = bool(ev) and not ev.get("is_error")
+            res[cli_model] = bool(ev) and not ev.get("is_error")
     bad = [m for m, ok in res.items() if not ok]
-    return OK(f"accepted: {list(res)}") if not bad else FAIL(f"rejected: {bad}")
+    return OK(f"accepted: {len(res)}") if not bad else FAIL(f"rejected: {bad}")
+
+
+@check("model.unknown_is_404", 2,
+       "Unknown model fails with api_error_status 404 (that is what we translate into our 404)")
+async def c_model_404(ctx):
+    async with CLI(model="claude-erfunden-9") as cli:
+        ev, _ = await cli.turn("Reply with exactly: OK")
+    if not ev or not ev.get("is_error"):
+        return FAIL(f"expected an error result, got {ev and ev.get('subtype')}")
+    st = ev.get("api_error_status")
+    # 'subtype' steht dabei auf "success" — nur is_error/api_error_status sind belastbar.
+    return OK(f"api_error_status={st}") if st == 404 else \
+        FAIL(f"api_error_status={st!r} (erwartet 404) — _upstream_code() prüfen")
 
 
 @check("tools.result_injection_trusted", 2,

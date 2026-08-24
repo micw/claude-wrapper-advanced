@@ -28,6 +28,13 @@ genuine drop-in OpenAI backend:
   progress indicator built from `estimated_tokens`, never invented reasoning.
 - **Per-request effort control** — OpenAI `reasoning_effort`, OpenRouter `reasoning.effort`, or a
   model-name suffix like `opus:max` (the model picker doubles as an effort selector).
+- **Explicit model list** — a finite, hand-kept registry (`app/config.py`), exposed without the
+  `claude-` prefix: `opus-5`, `opus-4-8`, `sonnet-5`, `sonnet-4-6`, `fable-5`, `haiku-4-5`, plus the
+  aliases `opus`/`sonnet`/`fable`/`haiku` resolved *by us* — CLI aliases drift with the CLI version.
+  An unknown model is a **404 `model_not_found`**, an unsupported effort a **400 `invalid_value`**
+  naming the valid levels; neither silently falls back to a default. Effort levels are validated
+  per model (no `xhigh` before Opus 4.7, none at all on Haiku), and `/v1/models` declares them
+  OpenRouter-style (`supported_efforts`, `context_length`, `name`).
 - **Real usage & cost** — OpenAI `usage` plus an OpenRouter-style `cost`, with cache read/write token stats.
 - **Observability** — `/metrics` exposes latency bands (ttft / spawn / overhead), cache hit-rate and the
   account-wide rate-limit status.

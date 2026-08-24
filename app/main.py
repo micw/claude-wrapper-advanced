@@ -12,18 +12,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import responses as rsp
 from .auth import auth_status
-from .config import settings
+from .config import DEFAULT_EFFORT, settings
 from .cli_driver import drive_turn
 from .metrics import metrics
 from .translate import (
-    EFFORT_LEVELS,
+    ApiError,
     ThinkingProgress,
     finish_from_stop,
-    map_effort,
-    map_model,
     messages_to_prompt,
     openai_tools_to_mcp,
-    split_model_effort,
+    resolve_request,
     tooluse_to_toolcalls,
 )
 
@@ -54,7 +52,23 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="claude-wrapper-advanced", version="1.3.2", lifespan=lifespan)
 
-_ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+@app.exception_handler(ApiError)
+async def _api_error_handler(req: Request, exc: ApiError):
+    """Unbekanntes Modell -> 404, ungültiger Effort -> 400, im OpenAI-Error-Envelope."""
+    return JSONResponse(status_code=exc.status, content=exc.envelope())
+
+
+def _upstream_code(err):
+    """CLI-Fehler -> HTTP-Status. Die CLI liefert bei Modellfehlern 'api_error_status': 404
+    mit — den reichen wir durch, statt alles pauschal als 502 auszugeben."""
+    if err.get("type") == "timeout":
+        return 504
+    status = err.get("status")
+    return status if isinstance(status, int) and 400 <= status < 600 else 502
+
+
+_ZERO_USAGE ={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
 def _usage_out(stats):
@@ -123,18 +137,44 @@ async def get_metrics():
     return snap
 
 
+def _model_obj(mid, name, ctx, levels, now, pinned=None):
+    """Ein /v1/models-Eintrag. Die Zusatzfelder sind OpenRouter-Konvention; strikte
+    OpenAI-Clients ignorieren sie, open-webui nutzt 'name' als Anzeigenamen."""
+    params = ["tools", "tool_choice"]
+    obj = {"id": mid, "object": "model", "created": now, "owned_by": "anthropic",
+           "name": name, "context_length": ctx}
+    if pinned:                       # Variante: die Effort-Wahl IST die ID
+        obj["reasoning"] = {"default_enabled": True, "default_effort": pinned}
+    elif levels:
+        params = ["reasoning", "reasoning_effort"] + params
+        obj["reasoning"] = {"mandatory": False, "default_enabled": True,
+                            "supported_efforts": list(reversed(levels)),
+                            "default_effort": DEFAULT_EFFORT}
+    obj["supported_parameters"] = params
+    return obj
+
+
 @app.get("/v1/models")
 async def list_models(req: Request):
     _require_auth(req)
     now = int(time.time())
-    ids = []
-    for m in settings.models:
-        ids.append(m)
-        if settings.effort_variants:                 # 'opus:max' etc. -> Picker = Effort-Selektor
-            ids += [f"{m}:{lvl}" for lvl in EFFORT_LEVELS]
-    return {"object": "list",
-            "data": [{"id": i, "object": "model", "created": now, "owned_by": "anthropic"}
-                     for i in ids]}
+    data = []
+    for mid, (_cli, name, ctx, levels) in settings.models.items():
+        data.append(_model_obj(mid, name, ctx, levels, now))
+    for alias, target in settings.aliases.items():
+        _cli, name, ctx, levels = settings.models[target]
+        data.append(_model_obj(alias, f"{name.split()[0]} (latest)", ctx, levels, now))
+    for alias, eff in settings.effort_picks:
+        target = settings.aliases.get(alias, alias)
+        entry = settings.models.get(target)
+        if entry is None or eff not in entry[3]:     # Fehlkonfiguration nicht ausliefern
+            log.warning("EFFORT_PICKS: '%s:%s' übersprungen (Modell oder Stufe unbekannt)",
+                        alias, eff)
+            continue
+        _cli, name, ctx, _levels = entry
+        data.append(_model_obj(f"{alias}:{eff}", f"{name.split()[0]} · {eff} effort",
+                               ctx, (), now, pinned=eff))
+    return {"object": "list", "data": data}
 
 
 def _chunk(cid, model, delta, finish=None):
@@ -167,14 +207,12 @@ async def chat_completions(req: Request):
             "message": "'messages' must be a non-empty array", "type": "invalid_request_error"}})
 
     tools = body.get("tools") or []
-    req_model = body.get("model") or settings.default_model
     # Modell-Suffix 'opus:max' -> Basismodell + Effort. Der Suffix ist der explizite
     # UI-Pick (Model-Picker als Effort-Selektor) und schlägt den Body-reasoning_effort.
-    base_model, effort_from_name = split_model_effort(req_model)
-    cli_model = map_model(base_model)
+    # Unbekanntes Modell/Effort wirft ApiError (404/400) statt still auf Default zu fallen.
+    cli_model, req_model, effort = resolve_request(body.get("model"), body)
     stream = bool(body.get("stream"))
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
-    effort = effort_from_name or map_effort(body)  # Name-Suffix > Body > Env-Default
 
     prompt = messages_to_prompt(messages)
     mcp_tools = openai_tools_to_mcp(tools)
@@ -262,7 +300,7 @@ async def chat_completions(req: Request):
         _record(req_model, False, stats, (time.perf_counter() - t0) * 1000)
 
     if err is not None:
-        code = 504 if err.get("type") == "timeout" else 502
+        code = _upstream_code(err)
         return JSONResponse(status_code=code,
                             content={"error": {"message": err.get("message"),
                                                "type": err.get("type", "api_error")}})
@@ -310,10 +348,7 @@ async def responses(req: Request):
         raise HTTPException(status_code=400, detail={"error": {
             "message": "'input' must not be empty", "type": "invalid_request_error"}})
 
-    req_model = body.get("model") or settings.default_model
-    base_model, effort_from_name = split_model_effort(req_model)
-    cli_model = map_model(base_model)
-    effort = effort_from_name or map_effort(body)
+    cli_model, req_model, effort = resolve_request(body.get("model"), body)
     stream = bool(body.get("stream"))
 
     prompt = messages_to_prompt(messages)
@@ -347,7 +382,7 @@ async def responses(req: Request):
         _record(req_model, False, stats, (time.perf_counter() - t0) * 1000)
 
     if err is not None:
-        code = 504 if err.get("type") == "timeout" else 502
+        code = _upstream_code(err)
         return JSONResponse(status_code=code, content=rsp.envelope(
             rid, req_model, [], status="failed", error={
                 "code": err.get("type", "api_error"), "message": err.get("message")},

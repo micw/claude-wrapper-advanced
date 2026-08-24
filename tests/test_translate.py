@@ -8,14 +8,17 @@ import unittest
 import zlib
 import struct
 
-from app.config import settings
+from app.config import clamp_effort, settings
 from app.translate import (
+    ApiError,
     ThinkingProgress,
+    body_effort,
+    check_effort,
     finish_from_stop,
-    map_effort,
-    map_model,
     messages_to_prompt,
     openai_tools_to_mcp,
+    resolve_model,
+    resolve_request,
     split_model_effort,
     tooluse_to_toolcalls,
 )
@@ -254,23 +257,73 @@ class TestPureHelpers(unittest.TestCase):
         self.assertEqual(finish_from_stop("something_new"), "stop")
 
     def test_split_model_effort(self):
+        # Ein ':' ist immer ein Effort-Suffix — auch ein ungültiger, damit er geprüft
+        # werden kann statt als Modellname durchzurutschen.
         self.assertEqual(split_model_effort("opus:max"), ("opus", "max"))
-        self.assertEqual(split_model_effort("opus:minimal"), ("opus", "low"))
+        self.assertEqual(split_model_effort("opus:nonsense"), ("opus", "nonsense"))
         self.assertEqual(split_model_effort("claude-opus-4-8"), ("claude-opus-4-8", None))
-        self.assertEqual(split_model_effort("opus[1m]"), ("opus[1m]", None))
-        self.assertEqual(split_model_effort("opus:nonsense"), ("opus:nonsense", None))
 
-    def test_map_effort_prefers_openrouter_shape(self):
-        self.assertEqual(map_effort({"reasoning": {"effort": "high"}, "reasoning_effort": "low"}),
-                         "high")
-        self.assertEqual(map_effort({"reasoning_effort": "XHIGH"}), "xhigh")
-        self.assertIsNone(map_effort({}))
+    def test_resolve_model_maps_alias_and_number(self):
+        self.assertEqual(resolve_model("opus-5")[:2], ("claude-opus-5", "opus-5"))
+        self.assertEqual(resolve_model("opus")[:2], ("claude-opus-5", "opus-5"))
+        self.assertEqual(resolve_model("haiku-4-5")[:2], ("claude-haiku-4-5", "haiku-4-5"))
+        # Leer -> DEFAULT_MODEL, aber der muss selbst in der Liste stehen.
+        self.assertEqual(resolve_model("")[1], settings.aliases.get(settings.default_model,
+                                                                    settings.default_model))
 
-    def test_map_model_falls_back_to_default(self):
-        self.assertEqual(map_model("sonnet"), "sonnet")
-        self.assertEqual(map_model("claude-opus-4-8"), "claude-opus-4-8")
-        self.assertEqual(map_model("gpt-4o"), settings.default_model)
-        self.assertEqual(map_model(""), settings.default_model)
+    def test_unknown_model_is_404(self):
+        for bad in ("gpt-4o", "claude-opus-4-8", "opus[1m]", "opus[2m]", "claude-erfunden-9"):
+            with self.assertRaises(ApiError) as cm:
+                resolve_model(bad)
+            self.assertEqual(cm.exception.status, 404)
+            self.assertEqual(cm.exception.code, "model_not_found")
+
+    def test_effort_prefers_openrouter_shape(self):
+        self.assertEqual(body_effort({"reasoning": {"effort": "high"},
+                                      "reasoning_effort": "low"}), ("high", "reasoning.effort"))
+        self.assertEqual(body_effort({"reasoning_effort": "XHIGH"}), ("xhigh", "reasoning_effort"))
+        self.assertEqual(body_effort({}), (None, None))
+
+    def test_effort_normalises_openai_only_values(self):
+        _cli, canon, levels = resolve_model("opus-5")
+        self.assertEqual(check_effort("minimal", canon, levels, "x"), "low")
+        self.assertEqual(check_effort("none", canon, levels, "x"), "low")
+
+    def test_invalid_effort_is_400_with_param(self):
+        _cli, canon, levels = resolve_model("opus-5")
+        with self.assertRaises(ApiError) as cm:
+            check_effort("bogus", canon, levels, "reasoning_effort")
+        self.assertEqual((cm.exception.status, cm.exception.code), (400, "invalid_value"))
+        self.assertEqual(cm.exception.param, "reasoning_effort")
+        self.assertIn("'xhigh'", cm.exception.message)      # nennt die gültigen Werte
+
+    def test_effort_is_validated_per_model(self):
+        # xhigh gibt es erst ab Opus 4.7 — auf 4.6 läuft es in der CLI still als high.
+        _cli, canon, levels = resolve_model("sonnet-4-6")
+        with self.assertRaises(ApiError) as cm:
+            check_effort("xhigh", canon, levels, "model")
+        self.assertEqual(cm.exception.status, 400)
+        # nennt den ungültigen Wert, listet ihn aber nicht als unterstützt
+        self.assertIn("Invalid value: 'xhigh'", cm.exception.message)
+        self.assertNotIn("and 'xhigh'", cm.exception.message)
+        # Haiku unterstützt Effort überhaupt nicht.
+        _cli, canon, levels = resolve_model("haiku-4-5")
+        with self.assertRaises(ApiError) as cm:
+            check_effort("low", canon, levels, "model")
+        self.assertIn("does not support", cm.exception.message)
+
+    def test_resolve_request_precedence(self):
+        # Name-Suffix schlägt Body.
+        self.assertEqual(resolve_request("opus:max", {"reasoning_effort": "low"}),
+                         ("claude-opus-5", "opus-5", "max"))
+        self.assertEqual(resolve_request("opus", {"reasoning_effort": "low"}),
+                         ("claude-opus-5", "opus-5", "low"))
+
+    def test_env_default_effort_is_clamped_not_rejected(self):
+        # Der Client hat den Env-Default nicht gewählt -> senken statt 400 (CLI-Verhalten).
+        self.assertEqual(clamp_effort("xhigh", ("low", "medium", "high", "max")), "high")
+        self.assertEqual(clamp_effort("max", ("low", "medium", "high", "max")), "max")
+        self.assertIsNone(clamp_effort("high", ()))         # Haiku: gar kein Effort
 
     def test_openai_tools_to_mcp(self):
         out = openai_tools_to_mcp([
