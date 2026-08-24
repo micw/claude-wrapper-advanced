@@ -3,7 +3,7 @@ import json
 import logging
 import uuid
 
-from .config import settings
+from .config import clamp_effort, settings
 
 log = logging.getLogger("translate")
 
@@ -113,6 +113,26 @@ def _images(content):
             log.warning("Bild-Part verworfen: %s", why)
             notes.append(f"[an image could not be passed through: {why}]")
     return blocks, notes
+
+
+def extract_client_system(messages):
+    """Führende system-Messages abtrennen -> (append_text|None, restliche messages).
+
+    Ein führender System-Block ist echte Systemebene und geht als --append-system-prompt
+    an die CLI (hinter unseren Basis-Prompt, den er damit ergänzt statt ersetzt). System-
+    Messages MITTEN im Verlauf haben keine saubere CLI-Entsprechung und bleiben Text
+    (messages_to_prompt rendert sie als '[System instructions]').
+    """
+    n = 0
+    parts = []
+    for m in messages:
+        if m.get("role") != "system":
+            break
+        t = _text(m.get("content"))
+        if t:
+            parts.append(t)
+        n += 1
+    return ("\n\n".join(parts) or None), messages[n:]
 
 
 def messages_to_prompt(messages):
@@ -260,51 +280,108 @@ def tooluse_to_toolcalls(tool_use_blocks):
     return out
 
 
-# Eingehende Reasoning-Effort-Werte (OpenAI + OpenRouter) -> CLI --effort-Level.
-# Die CLI kennt nur low|medium|high|xhigh|max; none/minimal auf low abbilden.
-_EFFORT_MAP = {
-    "none": "low", "minimal": "low", "low": "low",
-    "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max",
-}
-# Direkt exponierbare Effort-Stufen (für Modell-Varianten wie 'opus:max').
-EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
+class ApiError(Exception):
+    """Client-Fehler, der als HTTP-Status + OpenAI-Error-Envelope beim Aufrufer landet.
+
+    Ersetzt die früheren stillen Fallbacks auf den Default: unbekanntes Modell und
+    ungültiger Effort sind Fehler, keine Anlässe, heimlich etwas anderes zu tun.
+    Die CLI fängt nichts davon ab — '--effort bogus' läuft dort kommentarlos durch.
+    """
+
+    def __init__(self, status, message, type_="invalid_request_error", code=None, param=None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.type = type_
+        self.code = code
+        self.param = param
+
+    def envelope(self):
+        return {"error": {"message": self.message, "type": self.type,
+                          "param": self.param, "code": self.code}}
+
+
+# OpenAI-Werte ohne CLI-Entsprechung. Normalisieren ist erlaubt (es sind gültige
+# Eingaben), Raten ist es nicht — alles andere muss durch die Modell-Prüfung.
+_EFFORT_ALIASES = {"none": "low", "minimal": "low"}
+
+
+def _quoted_list(items):
+    """['low','medium','high'] -> \"'low', 'medium', and 'high'\" (OpenAI-Fehlerstil)."""
+    q = [f"'{i}'" for i in items]
+    if len(q) < 2:
+        return "".join(q)
+    return ", ".join(q[:-1]) + (", and " if len(q) > 2 else " and ") + q[-1]
 
 
 def split_model_effort(m):
-    """'opus:max' -> ('opus', 'max'). Suffix nur splitten, wenn es eine Effort-Stufe ist.
+    """'opus:max' -> ('opus', 'max'). Ein ':' ist immer ein Effort-Suffix.
 
-    Voller CLI-Name (claude-opus-4-8) oder 'opus[1m]' bleiben unangetastet, wenn kein
-    gültiger Effort-Suffix dranhängt. Rückgabe: (base_model, effort|None).
+    Kein Modellname enthält einen Doppelpunkt, also ist die Trennung eindeutig. Ob der
+    Suffix eine gültige Stufe IST, entscheidet check_effort() gegen das konkrete Modell —
+    'opus:nonsense' darf nicht als Modellname 'opus:nonsense' durchrutschen.
     """
     if m and ":" in m:
         base, _, suffix = m.rpartition(":")
-        eff = _EFFORT_MAP.get(suffix.strip().lower())
-        if eff and base:
-            return base, eff
+        if base:
+            return base, suffix.strip().lower()
     return m, None
 
 
-def map_effort(body):
-    """Client-getriebenes Reasoning-Effort aus dem Request-Body -> CLI-Effort-Level.
+def resolve_model(m):
+    """Externe Modell-ID (oder Alias) -> (CLI-Modellname, kanonische ID, Effort-Stufen).
 
-    OpenRouter (reasoning.effort) wird bevorzugt, OpenAI (reasoning_effort) ist Fallback.
-    Rückgabe: 'low'|'medium'|'high'|'xhigh'|'max' oder None (dann greift der Env-Default).
+    Unbekanntes -> 404 model_not_found, wie OpenAI und Anthropic es tun.
     """
-    r = body.get("reasoning")
-    val = r.get("effort") if isinstance(r, dict) else None
-    if val is None:
-        val = body.get("reasoning_effort")
-    if not isinstance(val, str):
+    m = (m or settings.default_model).strip()
+    canon = settings.aliases.get(m, m)
+    entry = settings.models.get(canon)
+    if entry is None:
+        raise ApiError(404, f"The model `{m}` does not exist or you do not have access to it.",
+                       code="model_not_found", param="model")
+    cli_model, _name, _ctx, levels = entry
+    return cli_model, canon, levels
+
+
+def check_effort(eff, canon, levels, param):
+    """Client-gewünschten Effort gegen die Stufen des Modells prüfen -> 400 bei Verstoß."""
+    if eff is None:
         return None
-    return _EFFORT_MAP.get(val.strip().lower())
+    eff = _EFFORT_ALIASES.get(eff, eff)
+    if not levels:
+        raise ApiError(400, f"Model `{canon}` does not support reasoning effort.",
+                       code="invalid_value", param=param)
+    if eff not in levels:
+        raise ApiError(400, f"Invalid value: '{eff}'. Supported values for `{canon}` are: "
+                            f"{_quoted_list(levels)}.", code="invalid_value", param=param)
+    return eff
 
 
-def map_model(m: str) -> str:
-    """OpenAI-Modell-ID -> CLI --model. Unbekanntes -> Default."""
-    if not m:
-        return settings.default_model
-    if m in settings.known_models:
-        return m
-    if m.startswith("claude-") or m.endswith("]"):  # volle Namen / opus[1m] durchreichen
-        return m
-    return settings.default_model
+def body_effort(body):
+    """(Wert, Parametername) aus dem Body. OpenRouter (reasoning.effort) schlägt OpenAI."""
+    r = body.get("reasoning")
+    if isinstance(r, dict) and r.get("effort") is not None:
+        return str(r["effort"]).strip().lower(), "reasoning.effort"
+    if body.get("reasoning_effort") is not None:
+        return str(body["reasoning_effort"]).strip().lower(), "reasoning_effort"
+    return None, None
+
+
+def resolve_request(req_model, body):
+    """Angefordertes Modell + Body -> (cli_model, kanonische ID, effort|None).
+
+    Reihenfolge wie bisher: Name-Suffix > Body > Env-Default. Neu ist, dass jede Stufe
+    davon einen Fehler auslösen kann, statt still auf etwas anderes zurückzufallen.
+    """
+    base, eff_from_name = split_model_effort(req_model or settings.default_model)
+    cli_model, canon, levels = resolve_model(base)
+
+    if eff_from_name is not None:
+        effort = check_effort(eff_from_name, canon, levels, "model")
+    else:
+        val, param = body_effort(body)
+        effort = check_effort(val, canon, levels, param)
+
+    if effort is None:                       # Env-Default: clampen statt ablehnen —
+        effort = clamp_effort(settings.effort, levels)   # der Client hat ihn nicht gewählt.
+    return cli_model, canon, effort

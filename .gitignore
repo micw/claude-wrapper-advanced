@@ -5,8 +5,9 @@ __pycache__/
 # Throwaway PoC (delete when done)
 mcp-roundtrip-test/
 
-# Raw HTTP capture
-system-prompts
+# Raw HTTP captures (reference dumps) — but the shipped chat.txt base prompt stays tracked
+system-prompts/*
+!system-prompts/chat.txt
 
 # Initial concept, kept locally
 KONZEPT.md

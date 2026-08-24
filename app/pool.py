@@ -19,10 +19,12 @@ from .cli_driver import _build_args, _timeout_evt, Silent, child_env, classify, 
 log = logging.getLogger("pool")
 
 
-def _key(model, mcp_tools, effort) -> str:
-    # effort ist ein Spawn-Zeit-Flag (--effort) -> muss in den Bucket, sonst würde eine
-    # z.B. mit high gespawnte Instanz für einen low-Request recycelt.
-    raw = model + "|" + (effort or "") + "|" + json.dumps(mcp_tools, sort_keys=True)
+def _key(model, mcp_tools, effort, append_system=None) -> str:
+    # effort UND append_system sind Spawn-Zeit-Flags (--effort / --append-system-prompt) ->
+    # müssen in den Bucket, sonst würde z.B. eine mit high gespawnte Instanz für einen
+    # low-Request recycelt, oder eine mit fremdem System-Prompt gespawnte weitergereicht.
+    raw = (model + "|" + (effort or "") + "|" + (append_system or "")
+           + "|" + json.dumps(mcp_tools, sort_keys=True))
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
@@ -172,8 +174,16 @@ class Proc:
                     # Kumulative CLI-Kosten -> Per-Turn-Delta umrechnen.
                     if ev[0] == "result" and stats.get("cost_usd") is not None:
                         total_cost = stats["cost_usd"]
+                        if total_cost < self._cum_cost:
+                            # Sollte nicht passieren: total_cost_usd ist pro Prozess kumulativ und
+                            # überlebt /clear (siehe cost.cumulative in tests/assumptions.py). Wenn
+                            # die CLI das ändert, liefert die Delta-Rechnung ab hier stumm 0.0 —
+                            # das darf nicht unbemerkt bleiben.
+                            log.warning("total_cost_usd fiel von %s auf %s — Kumulativ-Annahme "
+                                        "verletzt, per-Request-cost ist ab jetzt unbrauchbar",
+                                        self._cum_cost, total_cost)
                         stats["cost_usd"] = max(0.0, total_cost - self._cum_cost)
-                        self._cum_cost = total_cost
+                        self._cum_cost = max(self._cum_cost, total_cost)
                     yield ev
                     return
         finally:
@@ -196,9 +206,9 @@ class Pool:
         self._reaper = None
         self._closing = False
 
-    async def acquire(self, model, mcp_tools, effort=None):
-        key = _key(model, mcp_tools, effort)
-        args = _build_args(mcp_tools, model, effort)
+    async def acquire(self, model, mcp_tools, effort=None, append_system=None):
+        key = _key(model, mcp_tools, effort, append_system)
+        args = _build_args(mcp_tools, model, effort, append_system)
         async with self.cond:
             while True:
                 lst = self.idle.get(key)
@@ -297,13 +307,13 @@ class Pool:
 pool = Pool()
 
 
-async def pooled_drive_turn(prompt, mcp_tools, model, stats, effort=None):
+async def pooled_drive_turn(prompt, mcp_tools, model, stats, effort=None, append_system=None):
     # Bis zu 2 Versuche: eine idle gecrashte Instanz kann trotz Liveness-Check im Race
     # sterben. Retry ist nur sicher, SOLANGE noch nichts an den Client geflossen ist
     # (bei Streaming kann man Teil-Output nicht zurücknehmen).
     for attempt in (1, 2):
         t_acq = time.perf_counter()
-        key, p, reused = await pool.acquire(model, mcp_tools, effort)
+        key, p, reused = await pool.acquire(model, mcp_tools, effort, append_system)
         stats["reused"] = reused
         if not reused:  # neue Instanz: Acquire = Spawn + Warmup-Init
             stats["spawn_ms"] = (time.perf_counter() - t_acq) * 1000

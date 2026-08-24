@@ -4,8 +4,68 @@ import os
 import tempfile
 
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _truthy(v) -> bool:
     return str(v).lower() in ("1", "true", "yes", "on")
+
+
+# --------------------------------------------------------------------- Modelle
+# Endliche, handgepflegte Liste. Nach außen ohne 'claude-'-Präfix; an die CLI geht
+# IMMER der volle Name, nie ein Alias: CLI-Aliase driften mit der CLI-Version
+# (auf 2.1.198 zeigt 'opus' noch auf Opus 4.8, nicht auf Opus 5).
+# Reihenfolge = Rang, der erste Eintrag je Familie ist "das neueste".
+EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
+_EFF5 = EFFORT_ORDER
+_EFF4 = ("low", "medium", "high", "max")      # 'xhigh' gibt es erst ab Opus 4.7
+DEFAULT_EFFORT = "high"                       # CLI-Default auf allen Modellen außer Opus 4.7
+
+MODELS = {
+    # externe ID     CLI-Modell             Anzeige       Kontext    Effort-Stufen
+    "opus-5":     ("claude-opus-5",     "Opus 5",     1_000_000, _EFF5),
+    "opus-4-8":   ("claude-opus-4-8",   "Opus 4.8",   1_000_000, _EFF5),
+    "sonnet-5":   ("claude-sonnet-5",   "Sonnet 5",   1_000_000, _EFF5),
+    "fable-5":    ("claude-fable-5",    "Fable 5",    1_000_000, _EFF5),
+    "sonnet-4-6": ("claude-sonnet-4-6", "Sonnet 4.6", 1_000_000, _EFF4),
+    "haiku-4-5":  ("claude-haiku-4-5",  "Haiku 4.5",    200_000, ()),   # kein Effort
+}
+
+ALIASES = {"opus": "opus-5", "sonnet": "sonnet-5",
+           "haiku": "haiku-4-5", "fable": "fable-5"}
+# 'best' bewusst nicht: der CLI-Alias bedeutet "Fable, wo verfügbar, sonst neuestes Opus" —
+# eine statische Abbildung auf fable-5 verliert diese Bedeutung und dupliziert nur 'fable'.
+
+# Leiter von Absichten statt Kreuzprodukt: jeder Eintrag beantwortet "warum der und
+# nicht der daneben". Kleines Modell auf hoher Stufe fehlt bewusst — dafür gibt es
+# das größere Modell auf Default.
+DEFAULT_EFFORT_PICKS = "sonnet:low,opus:medium,opus:xhigh,opus:max"
+
+
+def _parse_picks(raw):
+    picks = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        model, _, eff = item.rpartition(":")
+        picks.append((model, eff))
+    return picks
+
+
+def clamp_effort(eff, levels):
+    """Operator-Default auf die höchste vom Modell unterstützte Stufe <= eff senken.
+
+    Spiegelt das dokumentierte CLI-Verhalten ('xhigh' läuft als 'high' auf Opus 4.6).
+    Gilt nur für den Env-Default — ein Client-Wunsch wird stattdessen mit 400 abgelehnt.
+    """
+    if not eff or not levels:
+        return None
+    if eff in levels:
+        return eff
+    want = EFFORT_ORDER.index(eff) if eff in EFFORT_ORDER else len(EFFORT_ORDER)
+    below = [l for l in levels if EFFORT_ORDER.index(l) <= want]
+    return below[-1] if below else None
 
 
 class Settings:
@@ -24,14 +84,24 @@ class Settings:
         self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "1800"))
         # Perf-Hebel (opt-in). Leer = CLI-Default.
         self.effort = os.getenv("EFFORT") or None        # low | medium | high | xhigh | max
+        # Basis-System-Prompt: hängt via --append-system-prompt HINTER den CLI-Default. Der
+        # Default (je Modell 1,4k-6,6k Token) bleibt bewusst stehen — er liefert Modell-Identität
+        # und das per-Modell korrekte knowledge-cutoff-Datum. Unsere Basis korrigiert nur dessen
+        # Terminal-/Tool-Framing, das hier nicht zutrifft. Ein führender Client-System-Prompt
+        # wird mit der Basis zu EINEM --append-system-prompt verkettet (siehe _build_args).
         self.system_prompt = os.getenv("SYSTEM_PROMPT") or None
         _spf = os.getenv("SYSTEM_PROMPT_FILE")
         if _spf and not self.system_prompt:
+            # Relative Pfade gegen das Repo-Root (Parent von app/) auflösen, nicht gegen den
+            # CWD des Servers — der ist unter uvicorn/Docker nicht garantiert das Repo.
+            path = _spf if os.path.isabs(_spf) else os.path.join(_REPO_ROOT, _spf)
             try:
-                with open(_spf, encoding="utf-8") as f:
+                with open(path, encoding="utf-8") as f:
                     self.system_prompt = f.read()
             except OSError:
-                pass
+                logging.getLogger("config").warning(
+                    "SYSTEM_PROMPT_FILE=%s nicht lesbar (aufgelöst: %s) — CLI-Default wird benutzt",
+                    _spf, path)
         # Thinking-Fortschritt als reasoning_content mitstreamen. Die CLI liefert KEINEN Denktext
         # (thinking ist leer, siehe cli.thinking_is_redacted) — nur estimated_tokens pro Event.
         # Daraus bauen wir eine Fortschrittszeile, sonst schweigt der Stream minutenlang.
@@ -61,12 +131,12 @@ class Settings:
         self.pool_max_uses = int(os.getenv("POOL_MAX_USES", "100"))       # danach recyceln
         self.pool_reap_interval = float(os.getenv("POOL_REAP_INTERVAL", "30"))
         self.clear_timeout = float(os.getenv("CLEAR_TIMEOUT", "15"))       # /clear ist instant; kurz halten
-        # Nach außen exponierte Modell-IDs (die CLI akzeptiert diese Aliase direkt).
-        self.models = ["sonnet", "opus", "haiku"]
-        self.known_models = set(self.models) | {"default"}
-        # Effort-Varianten (z.B. 'opus:max') zusätzlich in /v1/models listen, damit der
-        # Modell-Picker als Effort-Selektor dient (für UIs ohne eigenes Effort-Control).
-        self.effort_variants = _truthy(os.getenv("EFFORT_VARIANTS", "1"))
+        # Modell-Registry: endliche Liste, siehe MODELS/ALIASES unten.
+        self.models = MODELS
+        self.aliases = ALIASES
+        # Picker-Einträge mit festgenagelter Effort-Stufe ('opus:medium'). Leer = keine.
+        # Kein ':high' — das ist der Default und wäre ein Duplikat der nackten ID.
+        self.effort_picks = _parse_picks(os.getenv("EFFORT_PICKS", DEFAULT_EFFORT_PICKS))
         # Neutrales Arbeitsverzeichnis, damit die CLI kein CLAUDE.md/Projekt aufsammelt.
         self.workdir = os.getenv("WORKDIR") or tempfile.mkdtemp(prefix="claude-proxy-")
 
