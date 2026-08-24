@@ -19,6 +19,7 @@ from .translate import (
     ApiError,
     ThinkingProgress,
     finish_from_stop,
+    extract_client_system,
     messages_to_prompt,
     openai_tools_to_mcp,
     resolve_request,
@@ -214,6 +215,7 @@ async def chat_completions(req: Request):
     stream = bool(body.get("stream"))
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
+    append_system, messages = extract_client_system(messages)
     prompt = messages_to_prompt(messages)
     mcp_tools = openai_tools_to_mcp(tools)
     stats = {}
@@ -231,7 +233,7 @@ async def chat_completions(req: Request):
                 think = ThinkingProgress()
                 # Generator VOLL konsumieren (nicht break), damit der Pool die Instanz
                 # sauber draint/zurückgibt; nach dem Terminal-Event kommt nichts mehr.
-                async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
+                async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, append_system):
                     if done:
                         continue
                     if kind == "delta":
@@ -280,7 +282,7 @@ async def chat_completions(req: Request):
     # regelmäßig), fliegt ein CancelledError daran vorbei und inflight bliebe für immer erhöht.
     try:
         # Generator VOLL konsumieren (nicht break) -> Pool kann die Instanz sauber draina/zurückgeben.
-        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
+        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, append_system):
             if kind == "delta":
                 text_parts.append(data)
             elif kind == "tool_use":
@@ -351,6 +353,7 @@ async def responses(req: Request):
     cli_model, req_model, effort = resolve_request(body.get("model"), body)
     stream = bool(body.get("stream"))
 
+    append_system, messages = extract_client_system(messages)
     prompt = messages_to_prompt(messages)
     mcp_tools = openai_tools_to_mcp(rsp.tools_to_openai(body.get("tools")))
     stats = {}
@@ -359,14 +362,14 @@ async def responses(req: Request):
 
     if stream:
         return StreamingResponse(_responses_stream(rid, req_model, prompt, mcp_tools, cli_model,
-                                                   stats, effort, echo),
+                                                   stats, effort, echo, append_system),
                                  media_type="text/event-stream")
 
     metrics.start()
     t0 = time.perf_counter()
     text_parts, tool_calls, result_text, err = [], None, None, None
     try:
-        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
+        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, append_system):
             if kind == "delta":
                 text_parts.append(data)
             elif kind == "tool_use":
@@ -419,7 +422,8 @@ def _rsp_ctx(stats, echo):
             "cost": stats.get("cost_usd"), **echo}
 
 
-async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats, effort, echo):
+async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats, effort, echo,
+                            append_system=None):
     """SSE im Responses-Event-Format. Reihenfolge: created -> in_progress -> Items -> completed."""
     metrics.start()
     t0 = time.perf_counter()
@@ -441,7 +445,7 @@ async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats,
         msg_id, msg_idx, text_parts = rsp.new_id("msg"), None, []
         output, done = [], False
 
-        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort):
+        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, append_system):
             if done:
                 continue
             if kind == "thinking":

@@ -10,7 +10,8 @@ __pycache__
 *.md
 KONZEPT.md
 README.md
-system-prompts
+system-prompts/*
+!system-prompts/chat.txt
 mcp-roundtrip-test
 scratchpad
 Dockerfile

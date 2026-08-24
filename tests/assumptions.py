@@ -16,6 +16,7 @@ Exit code != 0 if any assumption FAILs.
 """
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -35,7 +36,7 @@ CLAUDE = settings.claude_bin
 # Flags/subcommands the proxy relies on -> must still exist in --help (drift early-warning).
 REQUIRED_FLAGS = [
     "--input-format", "--output-format", "--verbose", "--include-partial-messages",
-    "--no-session-persistence", "--tools", "--effort", "--system-prompt",
+    "--no-session-persistence", "--tools", "--effort", "--append-system-prompt",
     "--strict-mcp-config", "--mcp-config", "--allowedTools",
     "--dangerously-skip-permissions", "--model",
 ]
@@ -193,6 +194,57 @@ async def c_setuptoken(ctx):
     return OK() if "token" in out.decode().lower() else FAIL("not found")
 
 
+@check("sysprompt.append_last_wins", 1,
+       "Two --append-system-prompt: only the LAST reaches the API (why we concatenate base+client)")
+async def c_append_last_wins(ctx):
+    # Ein lokaler Fake-Backend fängt den Request-Body ab und antwortet 400 (die CLI gibt sofort auf).
+    # Kein Token-Verbrauch, daher Tier 1. Bricht das last-wins-Verhalten (-> first-wins/beide), muss
+    # _build_args angepasst werden — sonst verschwindet still der Client- oder der Basis-Prompt.
+    import http.server
+    import threading
+
+    captured = []
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("content-length") or 0)
+            with contextlib.suppress(Exception):
+                captured.append(json.loads(self.rfile.read(n)))
+            body = b'{"type":"error","error":{"type":"invalid_request_error","message":"x"}}'
+            self.send_response(400)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    env = {**child_env(), "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
+           "ANTHROPIC_API_KEY": "sk-assumptions-dummy"}
+    args = [CLAUDE, "-p", "hi", "--no-session-persistence", "--output-format", "stream-json",
+            "--verbose", "--tools", "", "--model", "sonnet",
+            "--append-system-prompt", "MARKER_FIRST_xyz",
+            "--append-system-prompt", "MARKER_LAST_xyz"]
+    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL,
+                                                stderr=asyncio.subprocess.DEVNULL, env=env)
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(proc.wait(), timeout=30)
+    with contextlib.suppress(Exception):
+        proc.kill()
+    srv.shutdown()
+    if not captured:
+        return SKIP("kein Request abgefangen (Base-URL nicht benutzt?)")
+    blob = "\n".join(b.get("text", "") for b in (captured[0].get("system") or []))
+    first, last = "MARKER_FIRST_xyz" in blob, "MARKER_LAST_xyz" in blob
+    if last and not first:
+        return OK("last-wins bestätigt")
+    return FAIL(f"last-wins verletzt: first={first} last={last} — _build_args-Verkettung prüfen")
+
+
 # ================================================================ TIER 2: ONLINE
 @check("env.no_parent_session", 1, "Parent Claude Code session markers are stripped from the CLI env")
 async def c_childenv(ctx):
@@ -283,6 +335,23 @@ async def c_shape(ctx):
         if cost is None:
             return FAIL("total_cost_usd missing")
         return OK(det)
+
+
+@check("cost.cumulative", 2,
+       "total_cost_usd is cumulative per process and survives /clear (pool computes per-turn deltas)")
+async def c_cost_cumulative(ctx):
+    # pool.Proc rechnet total_cost_usd auf ein Per-Turn-Delta um. Wäre der Wert per Turn (oder
+    # würde er bei /clear zurückgesetzt), lieferte die Subtraktion still 0.0 für jeden Turn.
+    async with CLI() as cli:
+        ev1, _ = await cli.turn("Say hi")
+        ev2, _ = await cli.turn("Say hi again")
+    c1 = ev1.get("total_cost_usd") if ev1 else None
+    c2 = ev2.get("total_cost_usd") if ev2 else None
+    if c1 is None or c2 is None:
+        return SKIP(f"no cost in result (c1={c1} c2={c2})")
+    if c2 > c1:
+        return OK(f"cumulative: turn1={c1:.6f} -> turn2={c2:.6f} (delta={c2 - c1:.6f})")
+    return FAIL(f"NOT cumulative: turn1={c1:.6f} turn2={c2:.6f} — pool delta would report 0.0")
 
 
 @check("tools.native_tooluse", 2, "MCP tool -> native tool_use (mcp__t__<name>) in the assistant event")

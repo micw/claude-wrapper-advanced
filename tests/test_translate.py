@@ -13,6 +13,7 @@ from app.translate import (
     ApiError,
     ThinkingProgress,
     body_effort,
+    extract_client_system,
     check_effort,
     finish_from_stop,
     messages_to_prompt,
@@ -63,6 +64,44 @@ class Base(unittest.TestCase):
     def tearDown(self):
         for k, v in self._saved.items():
             setattr(settings, k, v)
+
+
+class TestClientSystem(unittest.TestCase):
+    def test_leading_system_is_extracted(self):
+        app_sys, rest = extract_client_system([
+            {"role": "system", "content": "You translate to French."},
+            {"role": "user", "content": "hi"},
+        ])
+        self.assertEqual(app_sys, "You translate to French.")
+        self.assertEqual([m["role"] for m in rest], ["user"])
+
+    def test_multiple_leading_systems_join(self):
+        app_sys, rest = extract_client_system([
+            {"role": "system", "content": "A"},
+            {"role": "system", "content": "B"},
+            {"role": "user", "content": "hi"},
+        ])
+        self.assertEqual(app_sys, "A\n\nB")
+        self.assertEqual(len(rest), 1)
+
+    def test_no_system_returns_none_and_all(self):
+        app_sys, rest = extract_client_system([{"role": "user", "content": "hi"}])
+        self.assertIsNone(app_sys)
+        self.assertEqual(len(rest), 1)
+
+    def test_midconversation_system_stays_in_messages(self):
+        # Nur führende system-Messages werden abgetrennt; eine mitten im Verlauf bleibt Text.
+        app_sys, rest = extract_client_system([
+            {"role": "system", "content": "base"},
+            {"role": "user", "content": "a"},
+            {"role": "system", "content": "note in the middle"},
+            {"role": "user", "content": "b"},
+        ])
+        self.assertEqual(app_sys, "base")
+        self.assertEqual([m["role"] for m in rest], ["user", "system", "user"])
+        rendered = messages_to_prompt(rest)
+        blob = rendered if isinstance(rendered, str) else "".join(texts(rendered))
+        self.assertIn("note in the middle", blob)
 
 
 class TestTextOnly(Base):

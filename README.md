@@ -35,6 +35,15 @@ genuine drop-in OpenAI backend:
   naming the valid levels; neither silently falls back to a default. Effort levels are validated
   per model (no `xhigh` before Opus 4.7, none at all on Haiku), and `/v1/models` declares them
   OpenRouter-style (`supported_efforts`, `context_length`, `name`).
+- **Chat-shaped system prompt** — the CLI's default prompt frames the model as a terminal/coding
+  agent with file & shell tools that don't exist here. `SYSTEM_PROMPT_FILE` (`system-prompts/chat.txt`)
+  is **appended after** that default via `--append-system-prompt` and explicitly overrides the
+  terminal/tool framing, while keeping the default's useful bits — model identity and the per-model
+  knowledge-cutoff date (which the model otherwise under-guesses by ~a year, verified). A leading
+  client system message is concatenated into the same flag (the CLI honours only one), so the client
+  wins on conflict; the client part is a spawn-time flag and part of the pool bucket key. Tool-use
+  survives (the contract lives in `tools[]`, not the prompt) and today's date reaches the model via a
+  `<system-reminder>` in the user turn.
 - **Real usage & cost** — OpenAI `usage` plus an OpenRouter-style `cost`, with cache read/write token stats.
 - **Observability** — `/metrics` exposes latency bands (ttft / spawn / overhead), cache hit-rate and the
   account-wide rate-limit status.

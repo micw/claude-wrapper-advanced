@@ -115,6 +115,26 @@ def _images(content):
     return blocks, notes
 
 
+def extract_client_system(messages):
+    """Führende system-Messages abtrennen -> (append_text|None, restliche messages).
+
+    Ein führender System-Block ist echte Systemebene und geht als --append-system-prompt
+    an die CLI (hinter unseren Basis-Prompt, den er damit ergänzt statt ersetzt). System-
+    Messages MITTEN im Verlauf haben keine saubere CLI-Entsprechung und bleiben Text
+    (messages_to_prompt rendert sie als '[System instructions]').
+    """
+    n = 0
+    parts = []
+    for m in messages:
+        if m.get("role") != "system":
+            break
+        t = _text(m.get("content"))
+        if t:
+            parts.append(t)
+        n += 1
+    return ("\n\n".join(parts) or None), messages[n:]
+
+
 def messages_to_prompt(messages):
     """OpenAI-History -> CLI-User-content (die CLI antwortet sonst auf jede user-Message).
 
