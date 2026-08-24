@@ -101,7 +101,7 @@ def _usage_obj(u):
         "total_tokens": inp + out,
         "prompt_tokens_details": {
             "cached_tokens": u.get("cache_read_input_tokens") or 0,             # OpenAI-Standard (Cache-Hits)
-            "cache_creation_tokens": u.get("cache_creation_input_tokens") or 0,  # Extension (Cache-Writes)
+            "cache_write_tokens": u.get("cache_creation_input_tokens") or 0,     # Extension (Cache-Writes)
         },
     }
 

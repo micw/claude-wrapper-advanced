@@ -51,7 +51,7 @@ class Metrics:
         if usage:
             ptd = usage.get("prompt_tokens_details") or {}
             self.cache_read += ptd.get("cached_tokens") or 0
-            self.cache_write += ptd.get("cache_creation_tokens") or 0
+            self.cache_write += ptd.get("cache_write_tokens") or 0
             self.prompt_toks += usage.get("prompt_tokens") or 0
         if total_ms is not None:
             self.total.append(total_ms)
