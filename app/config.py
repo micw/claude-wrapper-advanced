@@ -99,7 +99,11 @@ class Settings:
         # via --append-system-prompt angehängt.
         self.replace_system_prompt = _truthy(os.getenv("REPLACE_SYSTEM_PROMPT", "1"))
         self.system_prompt = os.getenv("SYSTEM_PROMPT") or None
-        _spf = os.getenv("SYSTEM_PROMPT_FILE")
+        # Die gebündelte chat.txt ist der DEFAULT — sonst müsste jede Deployment-Umgebung (k8s,
+        # docker run, ...) SYSTEM_PROMPT_FILE selbst setzen, und ohne sie fiele man still auf den
+        # großen CLI-Default zurück. Wer den Basis-Prompt NICHT will, setzt REPLACE_SYSTEM_PROMPT=0
+        # (build_system_prompt liefert dann None) oder SYSTEM_PROMPT_FILE="".
+        _spf = os.getenv("SYSTEM_PROMPT_FILE", "system-prompts/chat.txt")
         if _spf and not self.system_prompt:
             # Relative Pfade gegen das Repo-Root (Parent von app/) auflösen, nicht gegen den
             # CWD des Servers — der ist unter uvicorn/Docker nicht garantiert das Repo.
