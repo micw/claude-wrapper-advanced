@@ -8,11 +8,13 @@ import unittest
 import zlib
 import struct
 
+from app.cli_driver import _build_args
 from app.config import clamp_effort, settings
 from app.translate import (
     ApiError,
     ThinkingProgress,
     body_effort,
+    build_system_prompt,
     extract_client_system,
     check_effort,
     finish_from_stop,
@@ -324,12 +326,12 @@ class TestPureHelpers(unittest.TestCase):
         self.assertEqual(body_effort({}), (None, None))
 
     def test_effort_normalises_openai_only_values(self):
-        _cli, canon, levels = resolve_model("opus-5")
+        _cli, canon, levels, _name, _cutoff = resolve_model("opus-5")
         self.assertEqual(check_effort("minimal", canon, levels, "x"), "low")
         self.assertEqual(check_effort("none", canon, levels, "x"), "low")
 
     def test_invalid_effort_is_400_with_param(self):
-        _cli, canon, levels = resolve_model("opus-5")
+        _cli, canon, levels, _name, _cutoff = resolve_model("opus-5")
         with self.assertRaises(ApiError) as cm:
             check_effort("bogus", canon, levels, "reasoning_effort")
         self.assertEqual((cm.exception.status, cm.exception.code), (400, "invalid_value"))
@@ -338,7 +340,7 @@ class TestPureHelpers(unittest.TestCase):
 
     def test_effort_is_validated_per_model(self):
         # xhigh gibt es erst ab Opus 4.7 — auf 4.6 läuft es in der CLI still als high.
-        _cli, canon, levels = resolve_model("sonnet-4-6")
+        _cli, canon, levels, _name, _cutoff = resolve_model("sonnet-4-6")
         with self.assertRaises(ApiError) as cm:
             check_effort("xhigh", canon, levels, "model")
         self.assertEqual(cm.exception.status, 400)
@@ -346,17 +348,82 @@ class TestPureHelpers(unittest.TestCase):
         self.assertIn("Invalid value: 'xhigh'", cm.exception.message)
         self.assertNotIn("and 'xhigh'", cm.exception.message)
         # Haiku unterstützt Effort überhaupt nicht.
-        _cli, canon, levels = resolve_model("haiku-4-5")
+        _cli, canon, levels, _name, _cutoff = resolve_model("haiku-4-5")
         with self.assertRaises(ApiError) as cm:
             check_effort("low", canon, levels, "model")
         self.assertIn("does not support", cm.exception.message)
 
     def test_resolve_request_precedence(self):
         # Name-Suffix schlägt Body.
-        self.assertEqual(resolve_request("opus:max", {"reasoning_effort": "low"}),
+        self.assertEqual(resolve_request("opus:max", {"reasoning_effort": "low"})[:3],
                          ("claude-opus-5", "opus-5", "max"))
-        self.assertEqual(resolve_request("opus", {"reasoning_effort": "low"}),
+        self.assertEqual(resolve_request("opus", {"reasoning_effort": "low"})[:3],
                          ("claude-opus-5", "opus-5", "low"))
+
+    def test_resolve_request_returns_identity_and_cutoff(self):
+        # identity/cutoff kommen aus der Registry, für den Replace-Basis-Prompt.
+        self.assertEqual(resolve_request("sonnet-4-6", {})[3:], ("Claude Sonnet 4.6", "August 2025"))
+        self.assertEqual(resolve_request("opus-5", {})[3:], ("Claude Opus 5", None))  # kein Cutoff
+
+
+class TestBuildArgsPrompts(unittest.TestCase):
+    """_build_args verdrahtet die übergebenen Prompt-Strings auf die richtigen CLI-Flags."""
+
+    @staticmethod
+    def _flags(args, flag):
+        return [args[i + 1] for i, a in enumerate(args) if a == flag]
+
+    def test_replace_uses_system_prompt_flag(self):
+        args = _build_args([], "claude-opus-5", system_prompt="BASE", append_system=None)
+        self.assertEqual(self._flags(args, "--system-prompt"), ["BASE"])
+        self.assertEqual(self._flags(args, "--append-system-prompt"), [])
+
+    def test_client_prompt_always_appends(self):
+        # Auch ohne Basis (REPLACE_SYSTEM_PROMPT=0 -> system_prompt None) wird der Client angehängt.
+        args = _build_args([], "claude-opus-5", system_prompt=None, append_system="CLIENT")
+        self.assertEqual(self._flags(args, "--system-prompt"), [])
+        self.assertEqual(self._flags(args, "--append-system-prompt"), ["CLIENT"])
+
+    def test_both_stack(self):
+        args = _build_args([], "claude-opus-5", system_prompt="BASE", append_system="CLIENT")
+        self.assertEqual(self._flags(args, "--system-prompt"), ["BASE"])
+        self.assertEqual(self._flags(args, "--append-system-prompt"), ["CLIENT"])
+
+    def test_neither_when_both_none(self):
+        args = _build_args([], "claude-opus-5")
+        self.assertNotIn("--system-prompt", args)
+        self.assertNotIn("--append-system-prompt", args)
+
+
+class TestBuildSystemPrompt(unittest.TestCase):
+    def setUp(self):
+        self._rep, self._sp = settings.replace_system_prompt, settings.system_prompt
+        settings.replace_system_prompt = True
+        settings.system_prompt = "BASE PROMPT."
+
+    def tearDown(self):
+        settings.replace_system_prompt, settings.system_prompt = self._rep, self._sp
+
+    def test_injects_identity_and_cutoff(self):
+        out = build_system_prompt("Claude Sonnet 4.6", "August 2025")
+        self.assertTrue(out.startswith("BASE PROMPT."))
+        self.assertIn("You are Claude Sonnet 4.6.", out)
+        self.assertIn("Your knowledge cutoff is August 2025.", out)
+        self.assertIn("Today's date is provided", out)
+
+    def test_omits_cutoff_when_none(self):
+        out = build_system_prompt("Claude Opus 5", None)
+        self.assertIn("You are Claude Opus 5.", out)
+        self.assertNotIn("knowledge cutoff", out)
+
+    def test_none_when_replace_disabled(self):
+        # REPLACE_SYSTEM_PROMPT=0 -> keine Basis, Default bleibt stehen (Client-Append separat).
+        settings.replace_system_prompt = False
+        self.assertIsNone(build_system_prompt("Claude Opus 5", "January 2026"))
+
+    def test_none_when_no_base_configured(self):
+        settings.system_prompt = None
+        self.assertIsNone(build_system_prompt("Claude Opus 5", "January 2026"))
 
     def test_env_default_effort_is_clamped_not_rejected(self):
         # Der Client hat den Env-Default nicht gewählt -> senken statt 400 (CLI-Verhalten).

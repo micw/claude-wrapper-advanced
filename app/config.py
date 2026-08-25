@@ -21,14 +21,20 @@ _EFF5 = EFFORT_ORDER
 _EFF4 = ("low", "medium", "high", "max")      # 'xhigh' gibt es erst ab Opus 4.7
 DEFAULT_EFFORT = "high"                       # CLI-Default auf allen Modellen außer Opus 4.7
 
+# Felder: (CLI-Modell, Anzeigename, Kontext, Effort-Stufen, knowledge-cutoff).
+# Cutoff wird im Replace-Modus mitgegeben, weil der CLI-Default — der ihn sonst pro Modell
+# liefert — dann weg ist und das Modell seine eigene Grenze sonst ~1 Jahr zu früh rät.
+# Werte aus dem CLI-Default abgelesen (tests/assumptions.py::model.registry gleicht sie ab);
+# None = die CLI nennt für dieses Modell keinen Cutoff (z.B. Opus 5) -> wir nennen auch keinen.
+# Pflege bei Modell-Releases, dieselbe Kadenz wie die Modell-Liste selbst.
 MODELS = {
-    # externe ID     CLI-Modell             Anzeige       Kontext    Effort-Stufen
-    "opus-5":     ("claude-opus-5",     "Opus 5",     1_000_000, _EFF5),
-    "opus-4-8":   ("claude-opus-4-8",   "Opus 4.8",   1_000_000, _EFF5),
-    "sonnet-5":   ("claude-sonnet-5",   "Sonnet 5",   1_000_000, _EFF5),
-    "fable-5":    ("claude-fable-5",    "Fable 5",    1_000_000, _EFF5),
-    "sonnet-4-6": ("claude-sonnet-4-6", "Sonnet 4.6", 1_000_000, _EFF4),
-    "haiku-4-5":  ("claude-haiku-4-5",  "Haiku 4.5",    200_000, ()),   # kein Effort
+    # externe ID     CLI-Modell             Anzeige       Kontext    Effort      Cutoff
+    "opus-5":     ("claude-opus-5",     "Opus 5",     1_000_000, _EFF5, None),
+    "opus-4-8":   ("claude-opus-4-8",   "Opus 4.8",   1_000_000, _EFF5, "January 2026"),
+    "sonnet-5":   ("claude-sonnet-5",   "Sonnet 5",   1_000_000, _EFF5, "January 2026"),
+    "fable-5":    ("claude-fable-5",    "Fable 5",    1_000_000, _EFF5, "January 2026"),
+    "sonnet-4-6": ("claude-sonnet-4-6", "Sonnet 4.6", 1_000_000, _EFF4, "August 2025"),
+    "haiku-4-5":  ("claude-haiku-4-5",  "Haiku 4.5",    200_000, (),    "February 2025"),
 }
 
 ALIASES = {"opus": "opus-5", "sonnet": "sonnet-5",
@@ -84,11 +90,14 @@ class Settings:
         self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "1800"))
         # Perf-Hebel (opt-in). Leer = CLI-Default.
         self.effort = os.getenv("EFFORT") or None        # low | medium | high | xhigh | max
-        # Basis-System-Prompt: hängt via --append-system-prompt HINTER den CLI-Default. Der
-        # Default (je Modell 1,4k-6,6k Token) bleibt bewusst stehen — er liefert Modell-Identität
-        # und das per-Modell korrekte knowledge-cutoff-Datum. Unsere Basis korrigiert nur dessen
-        # Terminal-/Tool-Framing, das hier nicht zutrifft. Ein führender Client-System-Prompt
-        # wird mit der Basis zu EINEM --append-system-prompt verkettet (siehe _build_args).
+        # Basis-System-Prompt: ERSETZT im Replace-Modus (Default) den CLI-Default via
+        # --system-prompt. Der Default (je Modell 1,4k-6,6k Token) beschreibt eine Terminal-/Tool-
+        # Umgebung, die hier nicht existiert. Ersetzen entfernt aber auch dessen Modell-Identität
+        # und knowledge-cutoff-Zeile -> die geben wir pro Modell selbst mit (build_system_prompt).
+        # REPLACE_SYSTEM_PROMPT=0 schaltet das ab: dann fassen wir den Default gar nicht an (kein
+        # replace, kein append unserer Basis) — NUR ein externer Client-System-Prompt wird immer
+        # via --append-system-prompt angehängt.
+        self.replace_system_prompt = _truthy(os.getenv("REPLACE_SYSTEM_PROMPT", "1"))
         self.system_prompt = os.getenv("SYSTEM_PROMPT") or None
         _spf = os.getenv("SYSTEM_PROMPT_FILE")
         if _spf and not self.system_prompt:

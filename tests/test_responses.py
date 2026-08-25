@@ -261,7 +261,7 @@ class TestStreamComposition(unittest.IsolatedAsyncioTestCase):
     """
 
     async def _events(self, turn):
-        async def fake_drive(prompt, mcp_tools, model, stats, effort, append_system=None):
+        async def fake_drive(prompt, mcp_tools, model, stats, effort, system_prompt=None, append_system=None):
             for kind, data in turn:
                 yield kind, data
 

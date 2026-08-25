@@ -36,7 +36,8 @@ CLAUDE = settings.claude_bin
 # Flags/subcommands the proxy relies on -> must still exist in --help (drift early-warning).
 REQUIRED_FLAGS = [
     "--input-format", "--output-format", "--verbose", "--include-partial-messages",
-    "--no-session-persistence", "--tools", "--effort", "--append-system-prompt",
+    "--no-session-persistence", "--tools", "--effort",
+    "--system-prompt", "--append-system-prompt",
     "--strict-mcp-config", "--mcp-config", "--allowedTools",
     "--dangerously-skip-permissions", "--model",
 ]
@@ -194,12 +195,13 @@ async def c_setuptoken(ctx):
     return OK() if "token" in out.decode().lower() else FAIL("not found")
 
 
-@check("sysprompt.append_last_wins", 1,
-       "Two --append-system-prompt: only the LAST reaches the API (why we concatenate base+client)")
-async def c_append_last_wins(ctx):
-    # Ein lokaler Fake-Backend fängt den Request-Body ab und antwortet 400 (die CLI gibt sofort auf).
-    # Kein Token-Verbrauch, daher Tier 1. Bricht das last-wins-Verhalten (-> first-wins/beide), muss
-    # _build_args angepasst werden — sonst verschwindet still der Client- oder der Basis-Prompt.
+@check("sysprompt.replace_and_append_stack", 1,
+       "--system-prompt (base) and --append-system-prompt (client) both reach the API and stack")
+async def c_sysprompt_stack(ctx):
+    # Lokales Fake-Backend fängt den Request-Body ab und antwortet 400 (die CLI gibt sofort auf).
+    # Kein Token-Verbrauch, daher Tier 1. Der Replace-Modus setzt darauf, dass --system-prompt den
+    # Default ersetzt UND ein --append-system-prompt zusätzlich ankommt (Client gewinnt bei Konflikt).
+    # Bricht das (nur eins der beiden kommt an), verschwindet still Basis oder Client.
     import http.server
     import threading
 
@@ -227,8 +229,8 @@ async def c_append_last_wins(ctx):
            "ANTHROPIC_API_KEY": "sk-assumptions-dummy"}
     args = [CLAUDE, "-p", "hi", "--no-session-persistence", "--output-format", "stream-json",
             "--verbose", "--tools", "", "--model", "sonnet",
-            "--append-system-prompt", "MARKER_FIRST_xyz",
-            "--append-system-prompt", "MARKER_LAST_xyz"]
+            "--system-prompt", "MARKER_BASE_xyz",
+            "--append-system-prompt", "MARKER_CLIENT_xyz"]
     proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL,
                                                 stderr=asyncio.subprocess.DEVNULL, env=env)
     with contextlib.suppress(asyncio.TimeoutError):
@@ -239,10 +241,10 @@ async def c_append_last_wins(ctx):
     if not captured:
         return SKIP("kein Request abgefangen (Base-URL nicht benutzt?)")
     blob = "\n".join(b.get("text", "") for b in (captured[0].get("system") or []))
-    first, last = "MARKER_FIRST_xyz" in blob, "MARKER_LAST_xyz" in blob
-    if last and not first:
-        return OK("last-wins bestätigt")
-    return FAIL(f"last-wins verletzt: first={first} last={last} — _build_args-Verkettung prüfen")
+    base, client = "MARKER_BASE_xyz" in blob, "MARKER_CLIENT_xyz" in blob
+    if base and client:
+        return OK("beide Flags stapeln")
+    return FAIL(f"Stacking verletzt: base={base} client={client} — _build_args prüfen")
 
 
 # ================================================================ TIER 2: ONLINE

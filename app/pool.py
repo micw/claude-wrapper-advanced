@@ -19,11 +19,13 @@ from .cli_driver import _build_args, _timeout_evt, Silent, child_env, classify, 
 log = logging.getLogger("pool")
 
 
-def _key(model, mcp_tools, effort, append_system=None) -> str:
-    # effort UND append_system sind Spawn-Zeit-Flags (--effort / --append-system-prompt) ->
-    # müssen in den Bucket, sonst würde z.B. eine mit high gespawnte Instanz für einen
-    # low-Request recycelt, oder eine mit fremdem System-Prompt gespawnte weitergereicht.
-    raw = (model + "|" + (effort or "") + "|" + (append_system or "")
+def _key(model, mcp_tools, effort, system_prompt=None, append_system=None) -> str:
+    # effort, system_prompt UND append_system sind Spawn-Zeit-Flags (--effort /
+    # --system-prompt / --append-system-prompt) -> müssen in den Bucket, sonst würde z.B. eine
+    # mit high gespawnte Instanz für einen low-Request recycelt, oder eine mit fremdem
+    # System-/Client-Prompt gespawnte weitergereicht. (system_prompt ist pro Modell verschieden,
+    # aber Modell steht ohnehin im Key; wir hashen ihn zur Sicherheit trotzdem mit.)
+    raw = (model + "|" + (effort or "") + "|" + (system_prompt or "") + "|" + (append_system or "")
            + "|" + json.dumps(mcp_tools, sort_keys=True))
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
@@ -206,9 +208,9 @@ class Pool:
         self._reaper = None
         self._closing = False
 
-    async def acquire(self, model, mcp_tools, effort=None, append_system=None):
-        key = _key(model, mcp_tools, effort, append_system)
-        args = _build_args(mcp_tools, model, effort, append_system)
+    async def acquire(self, model, mcp_tools, effort=None, system_prompt=None, append_system=None):
+        key = _key(model, mcp_tools, effort, system_prompt, append_system)
+        args = _build_args(mcp_tools, model, effort, system_prompt, append_system)
         async with self.cond:
             while True:
                 lst = self.idle.get(key)
@@ -307,13 +309,14 @@ class Pool:
 pool = Pool()
 
 
-async def pooled_drive_turn(prompt, mcp_tools, model, stats, effort=None, append_system=None):
+async def pooled_drive_turn(prompt, mcp_tools, model, stats, effort=None, system_prompt=None,
+                            append_system=None):
     # Bis zu 2 Versuche: eine idle gecrashte Instanz kann trotz Liveness-Check im Race
     # sterben. Retry ist nur sicher, SOLANGE noch nichts an den Client geflossen ist
     # (bei Streaming kann man Teil-Output nicht zurücknehmen).
     for attempt in (1, 2):
         t_acq = time.perf_counter()
-        key, p, reused = await pool.acquire(model, mcp_tools, effort, append_system)
+        key, p, reused = await pool.acquire(model, mcp_tools, effort, system_prompt, append_system)
         stats["reused"] = reused
         if not reused:  # neue Instanz: Acquire = Spawn + Warmup-Init
             stats["spawn_ms"] = (time.perf_counter() - t_acq) * 1000

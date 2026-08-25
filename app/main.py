@@ -18,6 +18,7 @@ from .metrics import metrics
 from .translate import (
     ApiError,
     ThinkingProgress,
+    build_system_prompt,
     finish_from_stop,
     extract_client_system,
     messages_to_prompt,
@@ -160,10 +161,10 @@ async def list_models(req: Request):
     _require_auth(req)
     now = int(time.time())
     data = []
-    for mid, (_cli, name, ctx, levels) in settings.models.items():
+    for mid, (_cli, name, ctx, levels, _cutoff) in settings.models.items():
         data.append(_model_obj(mid, name, ctx, levels, now))
     for alias, target in settings.aliases.items():
-        _cli, name, ctx, levels = settings.models[target]
+        _cli, name, ctx, levels, _cutoff = settings.models[target]
         data.append(_model_obj(alias, f"{name.split()[0]} (latest)", ctx, levels, now))
     for alias, eff in settings.effort_picks:
         target = settings.aliases.get(alias, alias)
@@ -172,7 +173,7 @@ async def list_models(req: Request):
             log.warning("EFFORT_PICKS: '%s:%s' übersprungen (Modell oder Stufe unbekannt)",
                         alias, eff)
             continue
-        _cli, name, ctx, _levels = entry
+        _cli, name, ctx, _levels, _cutoff = entry
         data.append(_model_obj(f"{alias}:{eff}", f"{name.split()[0]} · {eff} effort",
                                ctx, (), now, pinned=eff))
     return {"object": "list", "data": data}
@@ -211,11 +212,12 @@ async def chat_completions(req: Request):
     # Modell-Suffix 'opus:max' -> Basismodell + Effort. Der Suffix ist der explizite
     # UI-Pick (Model-Picker als Effort-Selektor) und schlägt den Body-reasoning_effort.
     # Unbekanntes Modell/Effort wirft ApiError (404/400) statt still auf Default zu fallen.
-    cli_model, req_model, effort = resolve_request(body.get("model"), body)
+    cli_model, req_model, effort, identity, cutoff = resolve_request(body.get("model"), body)
     stream = bool(body.get("stream"))
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
     append_system, messages = extract_client_system(messages)
+    system_prompt = build_system_prompt(identity, cutoff)   # None, wenn REPLACE_SYSTEM_PROMPT=0
     prompt = messages_to_prompt(messages)
     mcp_tools = openai_tools_to_mcp(tools)
     stats = {}
@@ -233,7 +235,7 @@ async def chat_completions(req: Request):
                 think = ThinkingProgress()
                 # Generator VOLL konsumieren (nicht break), damit der Pool die Instanz
                 # sauber draint/zurückgibt; nach dem Terminal-Event kommt nichts mehr.
-                async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, append_system):
+                async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, system_prompt, append_system):
                     if done:
                         continue
                     if kind == "delta":
@@ -282,7 +284,7 @@ async def chat_completions(req: Request):
     # regelmäßig), fliegt ein CancelledError daran vorbei und inflight bliebe für immer erhöht.
     try:
         # Generator VOLL konsumieren (nicht break) -> Pool kann die Instanz sauber draina/zurückgeben.
-        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, append_system):
+        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, system_prompt, append_system):
             if kind == "delta":
                 text_parts.append(data)
             elif kind == "tool_use":
@@ -350,10 +352,11 @@ async def responses(req: Request):
         raise HTTPException(status_code=400, detail={"error": {
             "message": "'input' must not be empty", "type": "invalid_request_error"}})
 
-    cli_model, req_model, effort = resolve_request(body.get("model"), body)
+    cli_model, req_model, effort, identity, cutoff = resolve_request(body.get("model"), body)
     stream = bool(body.get("stream"))
 
     append_system, messages = extract_client_system(messages)
+    system_prompt = build_system_prompt(identity, cutoff)   # None, wenn REPLACE_SYSTEM_PROMPT=0
     prompt = messages_to_prompt(messages)
     mcp_tools = openai_tools_to_mcp(rsp.tools_to_openai(body.get("tools")))
     stats = {}
@@ -362,14 +365,14 @@ async def responses(req: Request):
 
     if stream:
         return StreamingResponse(_responses_stream(rid, req_model, prompt, mcp_tools, cli_model,
-                                                   stats, effort, echo, append_system),
+                                                   stats, effort, echo, system_prompt, append_system),
                                  media_type="text/event-stream")
 
     metrics.start()
     t0 = time.perf_counter()
     text_parts, tool_calls, result_text, err = [], None, None, None
     try:
-        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, append_system):
+        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, system_prompt, append_system):
             if kind == "delta":
                 text_parts.append(data)
             elif kind == "tool_use":
@@ -423,7 +426,7 @@ def _rsp_ctx(stats, echo):
 
 
 async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats, effort, echo,
-                            append_system=None):
+                            system_prompt=None, append_system=None):
     """SSE im Responses-Event-Format. Reihenfolge: created -> in_progress -> Items -> completed."""
     metrics.start()
     t0 = time.perf_counter()
@@ -445,7 +448,7 @@ async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats,
         msg_id, msg_idx, text_parts = rsp.new_id("msg"), None, []
         output, done = [], False
 
-        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, append_system):
+        async for kind, data in drive_turn(prompt, mcp_tools, cli_model, stats, effort, system_prompt, append_system):
             if done:
                 continue
             if kind == "thinking":

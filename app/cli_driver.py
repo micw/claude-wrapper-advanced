@@ -47,7 +47,7 @@ def child_env():
     return env
 
 
-def _build_args(mcp_tools, model, effort=None, append_system=None):
+def _build_args(mcp_tools, model, effort=None, system_prompt=None, append_system=None):
     args = [
         "-p",
         "--input-format", "stream-json",
@@ -60,15 +60,15 @@ def _build_args(mcp_tools, model, effort=None, append_system=None):
     eff = effort or settings.effort           # per-Request > Env-Default
     if eff:                                    # Latenz-Hebel: low|medium|high|xhigh|max
         args += ["--effort", eff]
-    # Append-Modus: der CLI-Default BLEIBT stehen (er liefert Modell-Identität, das per-Modell
-    # korrekte knowledge-cutoff-Datum und via system-reminder das Tagesdatum). Unsere Basis
-    # (settings.system_prompt) korrigiert das Terminal/Tool-Framing des Defaults und hängt
-    # zusammen mit einem evtl. führenden Client-System-Prompt als EIN --append-system-prompt
-    # dahinter — zwei --append-system-prompt gehen nicht, die CLI nimmt nur das letzte (last-wins,
-    # empirisch verifiziert). Reihenfolge: Basis zuerst, Client danach (Client gewinnt bei Konflikt).
-    parts = [p for p in (settings.system_prompt, append_system) if p]
-    if parts:
-        args += ["--append-system-prompt", "\n\n".join(parts)]
+    # Beide Prompt-Strings werden übergeben (in main aus Registry+Config gebaut), nicht hier global
+    # gelesen. system_prompt (Basis + per-Modell Identität/Cutoff) ERSETZT den CLI-Default via
+    # --system-prompt; ist es None (REPLACE_SYSTEM_PROMPT=0), bleibt der Default stehen. Ein
+    # Client-System-Prompt hängt IMMER via --append-system-prompt dahinter — die beiden Flags
+    # stapeln (empirisch verifiziert), der Client gewinnt bei Konflikt.
+    if system_prompt:
+        args += ["--system-prompt", system_prompt]
+    if append_system:
+        args += ["--append-system-prompt", append_system]
     if mcp_tools:
         mcp_config = {
             "mcpServers": {
@@ -198,11 +198,12 @@ def _timeout_evt(silent=True):
     return ("error", {"type": "timeout", "message": msg})
 
 
-async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, append_system=None):
+async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_prompt=None,
+                        append_system=None):
     """Eine frische CLI pro Request (kein Reuse)."""
     t0 = time.perf_counter()
     proc = await asyncio.create_subprocess_exec(
-        settings.claude_bin, *_build_args(mcp_tools, model, effort, append_system),
+        settings.claude_bin, *_build_args(mcp_tools, model, effort, system_prompt, append_system),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -275,12 +276,15 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, append_sys
             log.debug("CLI stderr tail:\n%s", "\n".join(stderr_tail))
 
 
-async def drive_turn(prompt, mcp_tools, model, stats, effort=None, append_system=None):
+async def drive_turn(prompt, mcp_tools, model, stats, effort=None, system_prompt=None,
+                     append_system=None):
     """Öffentliche Schnittstelle: Pool (Reuse) oder One-Shot je nach Config."""
     if settings.pool_enabled:
         from .pool import pooled_drive_turn  # lazy: vermeidet Zirkularimport
-        async for ev in pooled_drive_turn(prompt, mcp_tools, model, stats, effort, append_system):
+        async for ev in pooled_drive_turn(prompt, mcp_tools, model, stats, effort,
+                                          system_prompt, append_system):
             yield ev
     else:
-        async for ev in _oneshot_turn(prompt, mcp_tools, model, stats, effort, append_system):
+        async for ev in _oneshot_turn(prompt, mcp_tools, model, stats, effort,
+                                      system_prompt, append_system):
             yield ev

@@ -329,9 +329,10 @@ def split_model_effort(m):
 
 
 def resolve_model(m):
-    """Externe Modell-ID (oder Alias) -> (CLI-Modellname, kanonische ID, Effort-Stufen).
+    """Externe Modell-ID (oder Alias) -> Registry-Eintrag.
 
-    Unbekanntes -> 404 model_not_found, wie OpenAI und Anthropic es tun.
+    Rückgabe: (cli_model, canon, levels, name, cutoff). Unbekanntes -> 404 model_not_found,
+    wie OpenAI und Anthropic es tun.
     """
     m = (m or settings.default_model).strip()
     canon = settings.aliases.get(m, m)
@@ -339,8 +340,8 @@ def resolve_model(m):
     if entry is None:
         raise ApiError(404, f"The model `{m}` does not exist or you do not have access to it.",
                        code="model_not_found", param="model")
-    cli_model, _name, _ctx, levels = entry
-    return cli_model, canon, levels
+    cli_model, name, _ctx, levels, cutoff = entry
+    return cli_model, canon, levels, name, cutoff
 
 
 def check_effort(eff, canon, levels, param):
@@ -368,13 +369,14 @@ def body_effort(body):
 
 
 def resolve_request(req_model, body):
-    """Angefordertes Modell + Body -> (cli_model, kanonische ID, effort|None).
+    """Angefordertes Modell + Body -> (cli_model, kanonische ID, effort|None, identity, cutoff).
 
-    Reihenfolge wie bisher: Name-Suffix > Body > Env-Default. Neu ist, dass jede Stufe
-    davon einen Fehler auslösen kann, statt still auf etwas anderes zurückzufallen.
+    Reihenfolge wie bisher: Name-Suffix > Body > Env-Default. Jede Stufe kann einen Fehler
+    auslösen, statt still auf etwas anderes zurückzufallen. identity/cutoff kommen aus der
+    Registry und werden im Replace-Modus in den Basis-Prompt gegeben (build_system_prompt).
     """
     base, eff_from_name = split_model_effort(req_model or settings.default_model)
-    cli_model, canon, levels = resolve_model(base)
+    cli_model, canon, levels, name, cutoff = resolve_model(base)
 
     if eff_from_name is not None:
         effort = check_effort(eff_from_name, canon, levels, "model")
@@ -384,4 +386,22 @@ def resolve_request(req_model, body):
 
     if effort is None:                       # Env-Default: clampen statt ablehnen —
         effort = clamp_effort(settings.effort, levels)   # der Client hat ihn nicht gewählt.
-    return cli_model, canon, effort
+    return cli_model, canon, effort, f"Claude {name}", cutoff
+
+
+def build_system_prompt(identity, cutoff):
+    """Basis-System-Prompt für den Replace-Modus: chat.txt + per-Modell Identität & Cutoff.
+
+    Rückgabe None, wenn Replace aus ist (REPLACE_SYSTEM_PROMPT=0) oder keine Basis (chat.txt)
+    konfiguriert ist — dann bleibt der CLI-Default stehen und liefert Identität/Cutoff selbst.
+    Der Client-System-Prompt wird davon unberührt IMMER separat angehängt (siehe _build_args).
+    """
+    if not settings.replace_system_prompt or not settings.system_prompt:
+        return None
+    facts = []
+    if identity:
+        facts.append(f"You are {identity}.")
+    if cutoff:
+        facts.append(f"Your knowledge cutoff is {cutoff}.")
+    facts.append("Today's date is provided with each message.")
+    return settings.system_prompt.rstrip() + "\n\n" + " ".join(facts)
