@@ -256,6 +256,11 @@ Always run the curl quick test before testing in the editor.
   *silence*, not after a fixed total duration — a total deadline kills long but healthy turns
   (production: first token at 164.9s, killed by the old 180s cap at 180s). `REQUEST_TIMEOUT` is
   just a backstop. Raise `IDLE_TIMEOUT` only if `cli.streams_continuously` reports gaps near it.
+- **A single CLI event can be megabytes.** The final `assistant`/`result` event carries the whole
+  answer on one line, so the stream reader is created with `STREAM_LIMIT` (16 MiB) instead of
+  asyncio's 64 KiB default — that default cut off large multi-file answers mid-stream. A line
+  beyond the limit still ends the turn (the buffer is unrecoverable), but as an `overlong_line`
+  error event, not as a truncated response body.
 - Per-request `cost` in `usage` is distorted for tool-call turns (cumulative cost is correct); see the pool notes in the code.
 
 ## Assumption tests

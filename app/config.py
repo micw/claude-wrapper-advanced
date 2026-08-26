@@ -88,6 +88,12 @@ class Settings:
         # still (Prefill; sonst < 2 s) — gemessen, siehe cli.streams_continuously.
         self.idle_timeout = float(os.getenv("IDLE_TIMEOUT", "60"))
         self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "1800"))
+        # Zeilenpuffer der CLI-Streams. asyncio.StreamReader hat 64 KiB Default — die Deltas
+        # sind klein, aber das finale assistant/result-Event trägt die GANZE Antwort auf EINER
+        # Zeile (~15k Output-Token JSON-escaped reichen schon). Prod 2026-08-26: zwei Requests
+        # starben daran mitten im Stream. Der Wert ist eine Puffer-Obergrenze PRO Reader, also
+        # im Worst Case STREAM_LIMIT x POOL_MAX_PROCS Speicher — nicht beliebig hochdrehen.
+        self.stream_limit = int(os.getenv("STREAM_LIMIT", str(16 << 20)))
         # Perf-Hebel (opt-in). Leer = CLI-Default.
         self.effort = os.getenv("EFFORT") or None        # low | medium | high | xhigh | max
         # Basis-System-Prompt: ERSETZT im Replace-Modus (Default) den CLI-Default via

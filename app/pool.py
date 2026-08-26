@@ -14,7 +14,8 @@ import time
 from collections import defaultdict, deque
 
 from .config import settings
-from .cli_driver import _build_args, _timeout_evt, Silent, child_env, classify, read_line
+from .cli_driver import (_build_args, _overlong_evt, _timeout_evt, Overlong, Silent,
+                         classify, read_line, spawn_cli)
 
 log = logging.getLogger("pool")
 
@@ -54,14 +55,7 @@ class Proc:
         self._cum_cost = 0.0   # total_cost_usd der CLI ist kumulativ pro Prozess
 
     async def start(self):
-        self.proc = await asyncio.create_subprocess_exec(
-            settings.claude_bin, *self.args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=settings.workdir,
-            env=child_env(),
-        )
+        self.proc = await spawn_cli(self.args)
         self._err_task = asyncio.create_task(self._drain_err())
         # Warm-up: /clear löst die CLI-Init aus (token-frei) und macht die Instanz nutzbar.
         # clear_timeout, NICHT request_timeout: das ist eine Sofort-Operation (~0.8s inkl. Init) —
@@ -93,7 +87,10 @@ class Proc:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise asyncio.TimeoutError
-            raw = await asyncio.wait_for(self.proc.stdout.readline(), timeout=remaining)
+            try:
+                raw = await asyncio.wait_for(self.proc.stdout.readline(), timeout=remaining)
+            except ValueError as e:
+                raise Overlong(str(e)) from e   # siehe read_line()
             if not raw:
                 raise EOFError("proc exited")
             try:
@@ -106,7 +103,7 @@ class Proc:
     async def _drain_after_interrupt(self):
         try:
             await self._await_result(settings.clear_timeout)
-        except (asyncio.TimeoutError, EOFError):
+        except (asyncio.TimeoutError, EOFError, Overlong):
             self.dead = True  # konnte nicht sauber in den Idle-Zustand -> verwerfen
 
     async def run_turn(self, prompt, stats):
@@ -120,7 +117,7 @@ class Proc:
         try:
             await self._send(_clear_msg())
             await self._await_result(settings.clear_timeout)
-        except (asyncio.TimeoutError, EOFError):
+        except (asyncio.TimeoutError, EOFError, Overlong):
             self.dead = True
             stats["outcome"] = "error"
             yield ("error", {"type": "cli_exit", "message": "pooled proc unresponsive on /clear"})
@@ -144,6 +141,15 @@ class Proc:
                     self.dead = True
                     stats["outcome"] = "timeout"
                     yield _timeout_evt(isinstance(e, Silent))
+                    return
+                except Overlong as e:
+                    # dead: readline() verwirft bei Überlauf den Puffer -> der Stream ist
+                    # desynchronisiert, die Instanz darf nicht zurück in den Pool.
+                    self.dead = True
+                    stats["outcome"] = "error"
+                    log.error("CLI-Zeile über STREAM_LIMIT (%s) — Turn verloren: %s",
+                              settings.stream_limit, e)
+                    yield _overlong_evt()
                     return
                 if not raw:
                     self.dead = True

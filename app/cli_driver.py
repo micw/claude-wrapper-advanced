@@ -168,8 +168,25 @@ def classify(m, stats, mark_ttft):
     return None
 
 
+async def spawn_cli(args):
+    """Startet die CLI. EINZIGE Spawn-Stelle — One-Shot und Pool teilen sie sich."""
+    return await asyncio.create_subprocess_exec(
+        settings.claude_bin, *args,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=settings.workdir,
+        env=child_env(),
+        limit=settings.stream_limit,   # NICHT weglassen: siehe settings.stream_limit
+    )
+
+
 class Silent(asyncio.TimeoutError):
     """Stille > idle_timeout — im Gegensatz zum Erreichen des Gesamt-Deckels."""
+
+
+class Overlong(Exception):
+    """Zeile > stream_limit. Der Turn ist verloren — readline() verwirft dabei den Puffer."""
 
 
 async def read_line(stdout, hard_deadline, loop):
@@ -190,6 +207,18 @@ async def read_line(stdout, hard_deadline, loop):
         if loop.time() >= hard_deadline:
             raise
         raise Silent from None
+    except ValueError as e:
+        # readline() fängt den LimitOverrunError selbst und wirft ValueError — ein
+        # `except LimitOverrunError` würde also nichts fangen. Hier umtypisieren, sonst fliegt
+        # es ungefangen bis in uvicorn ("Exception in ASGI application") und der Client sieht
+        # einen abgeschnittenen Body statt eines Fehlers.
+        raise Overlong(str(e)) from e
+
+
+def _overlong_evt():
+    return ("error", {"type": "overlong_line",
+                      "message": f"CLI emitted a line larger than STREAM_LIMIT "
+                                 f"({settings.stream_limit} bytes)"})
 
 
 def _timeout_evt(silent=True):
@@ -202,14 +231,7 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_pro
                         append_system=None):
     """Eine frische CLI pro Request (kein Reuse)."""
     t0 = time.perf_counter()
-    proc = await asyncio.create_subprocess_exec(
-        settings.claude_bin, *_build_args(mcp_tools, model, effort, system_prompt, append_system),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=settings.workdir,
-        env=child_env(),
-    )
+    proc = await spawn_cli(_build_args(mcp_tools, model, effort, system_prompt, append_system))
     stats["spawn_ms"] = (time.perf_counter() - t0) * 1000
     stats["reused"] = False
 
@@ -245,6 +267,12 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_pro
             except asyncio.TimeoutError as e:
                 stats["outcome"] = "timeout"
                 yield _timeout_evt(isinstance(e, Silent))
+                return
+            except Overlong as e:
+                stats["outcome"] = "error"
+                log.error("CLI-Zeile über STREAM_LIMIT (%s) — Turn verloren: %s",
+                          settings.stream_limit, e)
+                yield _overlong_evt()
                 return
             if not raw:
                 break  # EOF
