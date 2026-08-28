@@ -62,12 +62,27 @@ ACCOUNT_WIDE = ("five_hour", "seven_day")
 # TODO: gehört nach Settings, sobald der Arbeitsbaum dafür frei ist.
 USAGE_TTL = float(os.getenv("USAGE_TTL", "60"))
 
-_cache = {"at": 0.0, "val": None}
+_cache = {"at": 0.0, "val": None, "retry_at": None, "last_error": None}
 _lock = asyncio.Lock()
+
+
+# Sperrzeit nach einem Fehlschlag, wenn die Gegenstelle keine `Retry-After` nennt. Ohne
+# sie würde JEDER Consumer-Request einen neuen Versuch auslösen — bei einem 429 hielte der
+# Wrapper das Limit damit selbst am Leben. Gemessen im Betrieb: die Usage-API antwortet
+# durchaus mit 429, ohne dass das Kontingent erschöpft wäre.
+FAILURE_BACKOFF = float(os.getenv("USAGE_FAILURE_BACKOFF", "60"))
+
+#: Obergrenze für eine von der Gegenstelle genannte Wartezeit — ein absurder Wert soll den
+#: Endpunkt nicht für Stunden stilllegen.
+MAX_BACKOFF = 900.0
 
 
 class UsageUnavailable(Exception):
     """Der Stand konnte nicht geholt werden — mit dem Grund im Klartext."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 # ------------------------------------------------------------------ Schlüssel
@@ -265,26 +280,82 @@ def _fetch_sync():
         with urllib.request.urlopen(request, timeout=15) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as err:
-        raise UsageUnavailable(f"upstream {err.code}") from None
+        # Retry-After mitnehmen, wo die Gegenstelle eine nennt: bei 429 ist das die einzige
+        # Auskunft darüber, wann ein neuer Versuch überhaupt Sinn hat.
+        retry = None
+        try:
+            raw = (err.headers or {}).get("Retry-After")
+            retry = min(float(raw), MAX_BACKOFF) if raw else None
+        except (TypeError, ValueError):
+            retry = None
+        raise UsageUnavailable(f"upstream {err.code}", retry_after=retry) from None
     except (urllib.error.URLError, OSError, ValueError) as err:
         raise UsageUnavailable(str(err)) from None
+
+
+def _fresh(now):
+    return _cache["val"] is not None and now - _cache["at"] < USAGE_TTL
+
+
+def _blocked(now):
+    """Läuft noch eine Sperre aus einem vorherigen Fehlschlag?"""
+    return _cache["retry_at"] is not None and now < _cache["retry_at"]
+
+
+def _stale(reason):
+    """Der letzte bekannte Stand, als solcher gekennzeichnet.
+
+    Ein alter Füllstand ist brauchbar — die Auflösung beträgt ohnehin einen Prozentpunkt
+    und im Leerlauf bewegt sich nichts (MESSUNGEN.md §1). Nur wenn es überhaupt nichts
+    gibt, ist das ein Fehler.
+    """
+    if _cache["val"] is None:
+        return None
+    return {**_cache["val"], "stale": True, "stale_reason": reason}
 
 
 async def usage(force=False):
     """Kontingent-Block, gecacht. Ein Poll im Minutentakt verliert nichts (MESSUNGEN.md §1).
 
+    Nach einem Fehlschlag wird **gesperrt**, nicht weiterprobiert: sonst löst jeder
+    Consumer-Request einen neuen Upstream-Versuch aus und der Wrapper hält ein 429 selbst
+    am Leben. Solange ein Stand bekannt ist, wird der weitergereicht — mit `stale: true`,
+    damit niemand ihn für frisch hält. `force` umgeht den Cache, aber **nicht** die Sperre.
+
     Kein `httpx`: ein einzelner GET rechtfertigt keine Dependency in einem Projekt, das
     mit fastapi+uvicorn auskommt. urllib im Thread, damit der Event-Loop frei bleibt.
     """
     now = time.monotonic()
-    if not force and _cache["val"] is not None and now - _cache["at"] < USAGE_TTL:
+    if not force and _fresh(now):
         return _cache["val"]
+    if _blocked(now):
+        stale = _stale(_cache["last_error"])
+        if stale is not None:
+            return stale
+        raise UsageUnavailable(_cache["last_error"])
     async with _lock:
         now = time.monotonic()
-        if not force and _cache["val"] is not None and now - _cache["at"] < USAGE_TTL:
+        if not force and _fresh(now):
             return _cache["val"]
-        payload = await asyncio.to_thread(_fetch_sync)
+        if _blocked(now):
+            stale = _stale(_cache["last_error"])
+            if stale is not None:
+                return stale
+            raise UsageUnavailable(_cache["last_error"])
+        try:
+            payload = await asyncio.to_thread(_fetch_sync)
+        except UsageUnavailable as err:
+            wait = err.retry_after if err.retry_after is not None else FAILURE_BACKOFF
+            _cache["retry_at"] = time.monotonic() + wait
+            _cache["last_error"] = str(err)
+            log.warning("usage fetch failed (%s), retrying in %.0fs", err, wait)
+            stale = _stale(str(err))
+            if stale is not None:
+                return stale
+            raise
         value = from_usage(payload)
         _cache["val"] = value
         _cache["at"] = time.monotonic()
+        _cache["retry_at"] = None
+        _cache["last_error"] = None
         return value

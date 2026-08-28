@@ -112,6 +112,21 @@ Cache — gedacht für den Moment, in dem ein `limit_status` gemeldet hat.
 Ein Minutentakt verliert nichts: die Auflösung des Backends beträgt einen Prozentpunkt,
 und im Leerlauf bewegt sich der Zähler nicht (MESSUNGEN.md §1).
 
+### Wenn die Quelle nicht antwortet
+
+Die Usage-API des Backends limitiert sich **selbst** — im Betrieb beobachtet: ein `429`,
+während dasselbe Konto von anderer Stelle `200` bekam, ohne dass ein Kontingent erschöpft
+war. Der Wrapper reagiert darauf so:
+
+- **Sperre nach einem Fehlschlag** (`Retry-After`, sonst `USAGE_FAILURE_BACKOFF`, Standard
+  60 s, gedeckelt auf 15 min). Ohne sie löste jeder Consumer-Request einen neuen Versuch
+  aus und der Wrapper hielte ein 429 selbst am Leben. **`?force=1` umgeht die Sperre
+  nicht** — sonst wäre es genau dieser Umgehungsweg.
+- **Der letzte bekannte Stand wird weitergereicht**, markiert mit `stale: true` und
+  `stale_reason`. Ein alter Füllstand ist brauchbar, solange klar ist, dass er alt ist.
+- **`503` nur, wenn es überhaupt keinen Stand gibt** — also bis zum ersten erfolgreichen
+  Abruf nach dem Start.
+
 ---
 
 ## 4. Die Fensterschlüssel — und warum sie gebaut werden
@@ -174,6 +189,10 @@ Backend ein neues Fenster provisioniert.
 - **Keine Füllstände im Turn.** Siehe §5. Sie wären nur über einen Capture-Proxy im
   Auth-Pfad zu haben; die Abwägung und die Entscheidung dagegen stehen in MESSUNGEN.md §7.
 - **Höchstens ein `tool_call` pro Turn** — die Decke der CLI, nicht des Formats.
+
+Auch ein Tool-Turn endet nach `tool_call` mit `done` (`stop_reason: "tool_use"`). Seine Usage
+stammt aus der abschließenden Assistant-Message; Kosten können dort unbekannt sein, weil die CLI
+sie erst in einem `result` meldet, das ein unterbrochener Tool-Turn nicht erreicht.
 
 ---
 
