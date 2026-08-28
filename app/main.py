@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import responses as rsp
 from .auth import auth_status
-from .config import DEFAULT_EFFORT, settings
+from .config import DEFAULT_EFFORT, SERVICE, VERSION, settings
 from .cli_driver import drive_turn
 from .metrics import metrics
 from .translate import (
@@ -52,10 +52,7 @@ async def lifespan(app: FastAPI):
         await pool.shutdown()
 
 
-# Die Version wird ab 1.6.0 mit dem Git-Tag mitgeführt. Davor stand hier 1.3.2, während
-# die Tags schon bei 1.5.2 lagen — die Tags waren und bleiben die Wahrheit, dieser String
-# folgt ihnen von hier an.
-app = FastAPI(title="claude-wrapper-advanced", version="1.6.1", lifespan=lifespan)
+app = FastAPI(title=SERVICE, version=VERSION, lifespan=lifespan)
 
 # Eigenes Vokabular unter /wire/v1 — was in den OpenAI-Formaten keinen Platz hat.
 from .wire_api import router as wire_router   # noqa: E402  (nach app-Definition, kein Zyklus)

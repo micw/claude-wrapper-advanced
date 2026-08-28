@@ -107,7 +107,54 @@ Zwei Warnungen, die im Feld selbst nicht stehen können:
 
 ---
 
-## 3. `GET /wire/v1/usage`
+## 3. `GET /wire/v1/info` — womit spreche ich?
+
+```json
+{"service": "claude-wrapper-advanced", "version": "1.7.0"}
+```
+
+Mehr nicht, und das ist Absicht:
+
+- **Die Vertragsversion steht im Pfad.** `/wire/v1` sagt bereits, welches Format gilt; ein
+  zusätzliches Feld dafür wäre eine zweite Wahrheit über dieselbe Sache.
+- **`version` ist die Release-Version** und wandert mit dem Git-Tag. Wer sein Verhalten
+  daran festmacht, macht es am Falschen fest — dafür ist die Pfadversion da. Sie taugt für
+  Logs, Fehlerberichte und die Frage, ob ein Deployment schon die neue Fassung fährt.
+- **Fähigkeiten stehen dort, wo sie gelten:** was die Modelle können, sagt `/models`; wie
+  voll die Kontingente sind, sagt `/usage`. Ein dritter Ort, der beides zusammenfasst,
+  wäre eine Kopie, die veraltet.
+
+---
+
+## 4. `GET /wire/v1/models` — die Registry, ungeschminkt
+
+```json
+{"models": [
+  {"id": "opus-5", "name": "Opus 5", "backend_model": "claude-opus-5",
+   "context_length": 1000000,
+   "efforts": {"supported": ["low","medium","high","xhigh","max"], "default": "high"},
+   "knowledge_cutoff": null, "aliases": ["opus"]}
+]}
+```
+
+Der Unterschied zu `/v1/models`: dort werden aus sechs echten Modellen **vierzehn
+Einträge**, weil vier Aliase und vier Effort-Picks (`opus:max`, `sonnet:low`, …) als
+Pseudo-Modelle mitlaufen — das braucht ein Model-Picker, der die Effort-Wahl über die
+Modellauswahl abbilden muss. Ein Konsument dieser API braucht das Gegenteil: jedes Modell
+**einmal**, mit seinen Stufen als Feld und den Aliasen als Liste daran.
+
+`backend_model` ist der Name, den die CLI kennt — und derselbe Schlüssel, unter dem
+`done.cost.by_model` abrechnet. Nur damit lässt sich eine Kostenzeile einem Eintrag dieser
+Liste zuordnen; ohne ihn bliebe der Haiku-Nebenaufruf ein namenloser Posten.
+
+`efforts.default` ist der Env-Default, **abgesenkt auf das, was das Modell kennt** — dieselbe
+Absenkung, die ein Request erfährt. Ein Modell ohne Stufen (Haiku) hat `supported: []` und
+`default: null`, nicht `"high"`. `knowledge_cutoff` ist `null`, wo die CLI für ein Modell
+keinen nennt (Opus 5) — wir erfinden dann auch keinen.
+
+---
+
+## 5. `GET /wire/v1/usage`
 
 Der Kontingent-Stand des Kontos. **Die einzige Quelle für Füllstände** und für die Frage,
 welchem Modell ein Fenster gehört.
@@ -150,7 +197,7 @@ war. Der Wrapper reagiert darauf so:
 
 ---
 
-## 4. Die Fensterschlüssel — und warum sie gebaut werden
+## 6. Die Fensterschlüssel — und warum sie gebaut werden
 
 Turn und Usage-API benennen dieselben Fenster **verschieden**. Kontoweit stimmen sie
 überein; beim modell-skopierten Fenster gibt es in den Daten **keine** gemeinsame Kennung
@@ -174,7 +221,7 @@ Etikett zu bekommen.
 
 ---
 
-## 5. `limit_status`: Alarm, keine Anzeige
+## 7. `limit_status`: Alarm, keine Anzeige
 
 Das Ereignis kommt **nur**, wenn etwas anliegt: Warnung, Ablehnung, Guthaben in Benutzung
 oder ein Fehlercode. Nicht bei jedem Turn — insbesondere löst `overageStatus` allein nicht
@@ -198,7 +245,7 @@ Backend ein neues Fenster provisioniert.
 
 ---
 
-## 6. Was bewusst fehlt
+## 8. Was bewusst fehlt
 
 - **Kein Denktext.** Die CLI redigiert ihn; ein `text`-Feld, das nie Text trägt, wäre eine
   Lüge im Schema.
@@ -207,7 +254,7 @@ Backend ein neues Fenster provisioniert.
 - **Kein `active_group`.** Welches Fenster ein Turn belastet hat, sagt das Backend nicht.
   `limit_status.claim` ist die Wahl des Servers, welches Fenster er für repräsentativ hält
    — gemessen `five_hour` in 18 von 18 Turns, auch bei vollerem Wochenfenster.
-- **Keine Füllstände im Turn.** Siehe §5. Sie wären nur über einen Capture-Proxy im
+- **Keine Füllstände im Turn.** Siehe §7. Sie wären nur über einen Capture-Proxy im
   Auth-Pfad zu haben; die Abwägung und die Entscheidung dagegen stehen in MESSUNGEN.md §7.
 - **Höchstens ein `tool_call` pro Turn** — die Decke der CLI, nicht des Formats.
 
@@ -217,7 +264,7 @@ sie erst in einem `result` meldet, das ein unterbrochener Tool-Turn nicht erreic
 
 ---
 
-## 7. Stand der Umstellung
+## 9. Stand der Umstellung
 
 Intern ist der Wire-Strom die Quelle: Treiber und Pool liefern Ereignisse, `/wire/v1` gibt
 sie unverändert aus.

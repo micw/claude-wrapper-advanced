@@ -4,12 +4,15 @@ Getrennt von `/v1`, weil es eine eigene Entscheidung über die Exponierung ist: 
 Reverse-Proxy kommt mit einer Regel pro Präfix aus. Versioniert von Anfang an, weil sich
 `wire.Event` noch bewegt.
 
-Zwei Endpunkte:
+Vier Endpunkte:
 
 * `POST /responses` — ein Turn als SSE aus `wire`-Ereignissen. Was die OpenAI-Oberflächen
   verwerfen müssen (Kontingent-Alarm, Kosten pro Modell, Cache-Aufteilung nach TTL,
   Prozess-Zeiten), steht hier drin.
 * `GET /usage` — der Kontingent-Stand des Kontos, die einzige Quelle für Füllstände.
+* `GET /models` — die Registry ohne die Pseudo-Einträge, die `/v1/models` für Model-Picker
+  erzeugt (Aliase, Effort-Picks).
+* `GET /info` — Dienst und Version. Bewusst schmal; die Vertragsversion steht im Pfad.
 
 Die beiden hängen zusammen: ein `limit_status` im Strom nennt ein Fenster, aber keine
 Zahl — und schickt den Konsumenten damit an `/usage`.
@@ -24,7 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import limits
 from .auth import auth_status, require_api_key
 from .cli_driver import drive_turn_events
-from .config import settings
+from .config import DEFAULT_EFFORT, SERVICE, VERSION, clamp_effort, settings
 from .metrics import metrics
 from .translate import (ApiError, build_system_prompt, extract_client_system,
                         messages_to_prompt, openai_tools_to_mcp, resolve_request)
@@ -32,6 +35,57 @@ from .translate import (ApiError, build_system_prompt, extract_client_system,
 log = logging.getLogger("wire")
 
 router = APIRouter(prefix="/wire/v1", tags=["wire"])
+
+
+@router.get("/info")
+async def info(req: Request):
+    """Womit spricht der Konsument — Dienst und Version, mehr nicht.
+
+    Bewusst schmal. Die **Vertragsversion** steht bereits im Pfad (`/wire/v1`), ein eigenes
+    Feld dafür wäre Dopplung; und Fähigkeiten gehören dorthin, wo sie gelten: Modelle nach
+    `/models`, Kontingent nach `/usage`.
+
+    `version` ist die Release-Version und wandert mit dem Git-Tag. Ein Konsument, der sein
+    Verhalten daran festmacht, macht es am Falschen fest — dafür ist die Pfadversion da.
+    Sie taugt für Logs, Fehlerberichte und die Frage „läuft das Deployment schon neu?".
+    """
+    require_api_key(req)
+    return {"service": SERVICE, "version": VERSION}
+
+
+@router.get("/models")
+async def models(req: Request):
+    """Die Modell-Registry, ungeschminkt.
+
+    Unterschied zu `/v1/models`: dort werden aus sechs echten Modellen vierzehn Einträge,
+    weil Aliase und Effort-Picks (`opus:max`) als Pseudo-Modelle mitlaufen — das braucht ein
+    Model-Picker, der die Effort-Wahl über die Modellauswahl abbilden muss. Ein Konsument
+    dieser API braucht das Gegenteil: jedes Modell **einmal**, mit seinen Stufen als Feld.
+
+    `backend_model` ist der Name, den die CLI kennt — und derselbe Schlüssel, unter dem
+    `done.cost.by_model` abrechnet. Nur damit lässt sich eine Kostenzeile einem Modell
+    dieser Liste zuordnen.
+    """
+    require_api_key(req)
+    aliases = {}
+    for alias, target in settings.aliases.items():
+        aliases.setdefault(target, []).append(alias)
+
+    out = []
+    for mid, (cli_model, name, ctx, levels, cutoff) in settings.models.items():
+        # Der Env-Default gilt nur, soweit das Modell ihn kennt — dieselbe Absenkung, die
+        # ein Request erfährt. Ohne Stufen (Haiku) gibt es keinen Default, nicht "high".
+        default = clamp_effort(settings.effort or DEFAULT_EFFORT, levels) if levels else None
+        out.append({
+            "id": mid,
+            "name": name,
+            "backend_model": cli_model,
+            "context_length": ctx,
+            "efforts": {"supported": list(levels), "default": default},
+            "knowledge_cutoff": cutoff,
+            "aliases": aliases.get(mid, []),
+        })
+    return {"models": out}
 
 
 async def _body(req: Request):

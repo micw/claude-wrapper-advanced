@@ -6,6 +6,12 @@ import tempfile
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Name und Version an EINER Stelle: die FastAPI-App und /wire/v1/info lesen beide von hier.
+# Die Version wird mit dem Git-Tag mitgeführt (ab 1.6.0; davor stand sie auf 1.3.2, während
+# die Tags schon bei 1.5.2 lagen — die Tags waren und bleiben die Wahrheit).
+SERVICE = "claude-wrapper-advanced"
+VERSION = "1.7.0"
+
 
 def _truthy(v) -> bool:
     return str(v).lower() in ("1", "true", "yes", "on")
