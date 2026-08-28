@@ -97,6 +97,31 @@ def _require_auth(req: Request):
             )
 
 
+async def _request_json(req: Request):
+    """Read JSON with an enforced limit, including chunked requests without Content-Length."""
+    limit = settings.max_request_body_bytes
+    content_length = req.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > limit:
+                raise HTTPException(status_code=413, detail={"error": {
+                    "message": f"Request body exceeds the {limit}-byte limit",
+                    "type": "invalid_request_error", "code": "request_too_large"}})
+        except ValueError:
+            pass
+
+    chunks = []
+    size = 0
+    async for chunk in req.stream():
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(status_code=413, detail={"error": {
+                "message": f"Request body exceeds the {limit}-byte limit",
+                "type": "invalid_request_error", "code": "request_too_large"}})
+        chunks.append(chunk)
+    return json.loads(b"".join(chunks))
+
+
 def _log_req(model, stream, stats, total_ms):
     usage = stats.get("usage") or {}
     ptd = usage.get("prompt_tokens_details") or {}
@@ -201,7 +226,7 @@ async def chat_completions(req: Request):
                         "or set CLAUDE_CODE_OAUTH_TOKEN and restart."),
             "type": "server_error", "code": "not_authenticated"}})
 
-    body = await req.json()
+    body = await _request_json(req)
 
     messages = body.get("messages") or []
     if not messages:
@@ -342,7 +367,7 @@ async def responses(req: Request):
             "message": "Claude CLI is not authenticated.",
             "type": "server_error", "code": "not_authenticated"}})
 
-    body = await req.json()
+    body = await _request_json(req)
     try:
         messages = rsp.input_to_messages(body)
     except ValueError as e:

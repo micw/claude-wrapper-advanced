@@ -81,6 +81,10 @@ class Settings:
         self.api_key = os.getenv("API_KEY") or None
         self.claude_bin = os.getenv("CLAUDE_BIN", "claude")
         self.default_model = os.getenv("DEFAULT_MODEL", "sonnet")
+        # Explizite HTTP-Body-Grenze, passend zu nginx `client_max_body_size 32m`.
+        # Starlette puffert Request.json() sonst ohne eigene Obergrenze; direkte Zugriffe auf
+        # den Wrapper könnten damit die Proxy-Grenze umgehen.
+        self.max_request_body_bytes = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(32 << 20)))
         # Zwei Uhren: die Idle-Schwelle ist die eigentliche Grenze (Stille zwischen zwei
         # Stream-Zeilen), REQUEST_TIMEOUT nur noch die Reißleine für den Gesamt-Turn.
         # Eine reine Gesamtfrist würde laufende Antworten abschneiden: opus/xhigh denkt

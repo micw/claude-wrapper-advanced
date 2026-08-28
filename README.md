@@ -135,6 +135,10 @@ cp .env.example .env      # optionally adjust (port, API_KEY, DEFAULT_MODEL)
 
 The server then runs on `http://127.0.0.1:8000`.
 
+JSON request bodies are limited to **32 MiB** by default (`MAX_REQUEST_BODY_BYTES=33554432`),
+matching nginx `client_max_body_size 32m`. The limit also applies to chunked requests without a
+`Content-Length` header.
+
 ## Docker
 
 The image bundles the official Claude Code CLI (via npm) and runs as a **non-root** user
