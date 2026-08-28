@@ -7,13 +7,31 @@ Login im laufenden Container erholt sich der Status innerhalb der TTL.
 """
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import time
 
+from fastapi import HTTPException, Request
+
 from .config import settings
 
 log = logging.getLogger("auth")
+
+
+def require_api_key(req: Request):
+    """API_KEY-Prüfung für einen Endpunkt. Ohne gesetzten API_KEY offen (lokaler Betrieb).
+
+    Liegt hier und nicht im Endpunkt-Modul, damit /v1 und /wire/v1 dieselbe Prüfung
+    benutzen statt zweier Kopien, die auseinanderlaufen.
+    """
+    if not settings.api_key:
+        return
+    got = req.headers.get("authorization", "")
+    if not hmac.compare_digest(got, f"Bearer {settings.api_key}"):
+        raise HTTPException(status_code=401, detail={"error": {
+            "message": "Invalid API key",
+            "type": "invalid_request_error", "code": "invalid_api_key"}})
 
 _TTL_OK = 30.0        # eingeloggt: selten neu prüfen
 _TTL_FAIL = 5.0       # ausgeloggt: schnell erholen, sobald jemand /login macht
