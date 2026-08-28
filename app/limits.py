@@ -337,34 +337,51 @@ def _stale(reason):
     return {**_cache["val"], "stale": True, "stale_reason": reason}
 
 
-async def usage(force=False):
+def _remaining(now):
+    """Restzeit der Sperre in Sekunden — nicht der ursprüngliche `Retry-After`.
+
+    Nennt die Gegenstelle 871 s, sind zehn Minuten später noch 271 übrig. Wer den
+    Ausgangswert weiterreichte, ließe den Konsumenten unnötig lange warten.
+    """
+    if _cache["retry_at"] is None:
+        return None
+    return max(0.0, _cache["retry_at"] - now)
+
+
+async def usage():
     """Kontingent-Block, gecacht. Ein Poll im Minutentakt verliert nichts (MESSUNGEN.md §1).
 
     Nach einem Fehlschlag wird **gesperrt**, nicht weiterprobiert: sonst löst jeder
     Consumer-Request einen neuen Upstream-Versuch aus und der Wrapper hält ein 429 selbst
     am Leben. Solange ein Stand bekannt ist, wird der weitergereicht — mit `stale: true`,
-    damit niemand ihn für frisch hält. `force` umgeht den Cache, aber **nicht** die Sperre.
+    damit niemand ihn für frisch hält.
+
+    **Kein `force`.** Es gab einmal einen Parameter, der den Cache umging — aber nicht die
+    Sperre, und damit versprach er etwas, das er im wichtigsten Fall nicht halten konnte.
+    Außerhalb einer Sperre löste er einen Zusatz-Request aus und erhöhte damit die Chance
+    auf genau die Drosselung, gegen die die Sperre existiert. Gewinnen konnte man nichts:
+    die Auflösung des Füllstands ist ein Prozentpunkt, im Minutentakt bewegt sich nichts.
 
     Kein `httpx`: ein einzelner GET rechtfertigt keine Dependency in einem Projekt, das
     mit fastapi+uvicorn auskommt. urllib im Thread, damit der Event-Loop frei bleibt.
     """
     now = time.monotonic()
-    if not force and _fresh(now):
+    if _fresh(now):
         return _cache["val"]
     if _blocked(now):
         stale = _stale(_cache["last_error"])
         if stale is not None:
             return stale
-        raise UsageUnavailable(_cache["last_error"])
+        raise UsageUnavailable(_cache["last_error"], retry_after=_remaining(now))
     async with _lock:
         now = time.monotonic()
-        if not force and _fresh(now):
+        if _fresh(now):
             return _cache["val"]
         if _blocked(now):
             stale = _stale(_cache["last_error"])
             if stale is not None:
                 return stale
-            raise UsageUnavailable(_cache["last_error"])
+            raise UsageUnavailable(_cache["last_error"], retry_after=_remaining(now))
         try:
             payload = await asyncio.to_thread(_fetch_sync)
         except UsageUnavailable as err:

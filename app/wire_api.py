@@ -167,23 +167,34 @@ async def responses(req: Request):
 
 
 @router.get("/usage")
-async def get_usage(req: Request, force: bool = False):
+async def get_usage(req: Request):
     """Kontingent des Kontos: welche Fenster es gibt, wem sie gehören, wie voll sie sind.
 
-    Ein Request an das Backend, gecacht (`USAGE_TTL`, Standard 60 s). `?force=1` umgeht
-    den Cache — gedacht für den Fall, dass ein `limit_status` im Turn gemeldet hat und
-    der Konsument den frischen Stand braucht.
+    Ein Request an das Backend, gecacht (`USAGE_TTL`, Standard 60 s). Häufiger zu fragen
+    bringt nichts: die Auflösung des Füllstands ist ein Prozentpunkt, und im Minutentakt
+    bewegt sich nichts (MESSUNGEN.md §1).
 
     Die einzige Quelle für Füllstände und für die Frage, welchem **Modell** ein Fenster
     gehört: das Turn-Ereignis trägt beides nicht (MESSUNGEN.md §4.1).
     """
     require_api_key(req)
     try:
-        return await limits.usage(force=force)
+        return await limits.usage()
     except limits.UsageUnavailable as err:
         # 503 und nicht 502: der Dienst arbeitet, nur diese Auskunft steht gerade nicht
         # zur Verfügung. Turns laufen davon unberührt weiter.
-        log.warning("usage unavailable: %s", err)
-        return JSONResponse(status_code=503, content={"error": {
-            "message": f"quota state unavailable: {err}",
-            "type": "server_error", "code": "usage_unavailable"}})
+        #
+        # Mit `Retry-After`, wo wir eine Zeit kennen. Die Gegenstelle nennt sie im 429
+        # (beobachtet: 871 s), wir werten sie intern längst aus — sie aber für uns zu
+        # behalten heißt, dass der Konsument raten muss. Beobachtet: fünf Versuche in drei
+        # Sekunden, was die Drosselung nur verlängert. Der Header ist bei einem 503 der
+        # vorgesehene Weg (RFC 9110); das Feld im Body ist für Clients, die nur JSON lesen.
+        retry = None if err.retry_after is None else max(0, int(err.retry_after))
+        log.warning("usage unavailable: %s (retry_after=%s)", err, retry)
+        body = {"message": f"quota state unavailable: {err}",
+                "type": "server_error", "code": "usage_unavailable"}
+        headers = {}
+        if retry is not None:
+            body["retry_after"] = retry
+            headers["Retry-After"] = str(retry)
+        return JSONResponse(status_code=503, content={"error": body}, headers=headers)

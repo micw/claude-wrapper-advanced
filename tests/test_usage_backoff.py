@@ -40,14 +40,39 @@ class Backoff(unittest.IsolatedAsyncioTestCase):
                     await limits.usage()
         self.assertEqual(fetch.call_count, 1, "nach dem Fehlschlag wird gesperrt")
 
-    async def test_force_does_not_bypass_the_block(self):
-        err = limits.UsageUnavailable("upstream 429")
-        with mock.patch.object(limits, "_fetch_sync", side_effect=err) as fetch:
+    async def test_there_is_no_way_to_bypass_the_block(self):
+        """Es gab einmal ein `force`, das den Cache umging — aber nicht die Sperre.
+
+        Damit versprach es etwas, das es im wichtigsten Fall nicht halten konnte, und
+        außerhalb einer Sperre erhöhte es die Chance auf genau die Drosselung. Der
+        Parameter ist weg; dieser Test hält fest, dass keiner nachwächst.
+        """
+        import inspect
+        self.assertEqual(list(inspect.signature(limits.usage).parameters), [],
+                         "usage() nimmt keine Argumente — kein Umgehungsweg zum Hammer")
+
+    async def test_the_block_reports_the_remaining_time(self):
+        """Die Restzeit muss mit, sonst rät der Konsument.
+
+        Beobachtet ohne sie: fünf Abrufe in drei Sekunden, was die Drosselung nur
+        verlängert. Und es ist die **Rest**zeit, nicht der Ausgangswert — nach der
+        halben Sperre ist die Hälfte übrig.
+        """
+        err = limits.UsageUnavailable("upstream 429", retry_after=120)
+        with mock.patch.object(limits, "_fetch_sync", side_effect=err):
             with self.assertRaises(limits.UsageUnavailable):
                 await limits.usage()
-            with self.assertRaises(limits.UsageUnavailable):
-                await limits.usage(force=True)
-        self.assertEqual(fetch.call_count, 1, "sonst wäre force der Umgehungsweg zum Hammer")
+            # Zweiter Abruf: aus der Sperre, mit Restzeit statt ohne.
+            with self.assertRaises(limits.UsageUnavailable) as caught:
+                await limits.usage()
+        self.assertIsNotNone(caught.exception.retry_after)
+        self.assertGreater(caught.exception.retry_after, 118)
+        self.assertLessEqual(caught.exception.retry_after, 120)
+
+    async def test_the_remaining_time_never_goes_negative(self):
+        """Eine abgelaufene Sperre darf keine negative Wartezeit melden."""
+        limits._cache["retry_at"] = __import__("time").monotonic() - 5
+        self.assertEqual(limits._remaining(__import__("time").monotonic()), 0.0)
 
     async def test_retry_after_is_honoured(self):
         err = limits.UsageUnavailable("upstream 429", retry_after=42)

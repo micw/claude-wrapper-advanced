@@ -81,3 +81,40 @@ class Models(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class UsageUnavailableResponse(unittest.TestCase):
+    """Der 503 muss sagen, wann es wieder Sinn hat.
+
+    Die Gegenstelle nennt im 429 ein `Retry-After` (beobachtet: 871 s), und der Wrapper
+    wertet es intern längst aus. Es für sich zu behalten heißt, dass der Konsument raten
+    muss — beobachtet wurden fünf Abrufe in drei Sekunden, was die Drosselung verlängert.
+    """
+
+    @staticmethod
+    def _call_with(err):
+        from unittest import mock
+        with mock.patch.object(wire_api.limits, "usage", side_effect=err):
+            return asyncio.run(wire_api.get_usage(FakeRequest()))
+
+    def test_retry_after_reaches_the_client(self):
+        from app import limits
+        resp = self._call_with(limits.UsageUnavailable("upstream 429", retry_after=871.0))
+
+        self.assertEqual(resp.status_code, 503)
+        # Header: der von RFC 9110 fuer 503 vorgesehene Weg, ganze Sekunden.
+        self.assertEqual(resp.headers["retry-after"], "871")
+        # Body: fuer Clients, die nur JSON lesen.
+        import json
+        body = json.loads(resp.body)["error"]
+        self.assertEqual(body["retry_after"], 871)
+        self.assertEqual(body["code"], "usage_unavailable")
+
+    def test_without_a_known_time_no_header_is_invented(self):
+        from app import limits
+        resp = self._call_with(limits.UsageUnavailable("no OAuth token"))
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertNotIn("retry-after", resp.headers)
+        import json
+        self.assertNotIn("retry_after", json.loads(resp.body)["error"])
+

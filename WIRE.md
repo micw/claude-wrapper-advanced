@@ -174,8 +174,10 @@ welchem Modell ein Fenster gehört.
 }
 ```
 
-Ein Request an das Backend, gecacht (`USAGE_TTL`, Standard 60 s). `?force=1` umgeht den
-Cache — gedacht für den Moment, in dem ein `limit_status` gemeldet hat.
+Ein Request an das Backend, gecacht (`USAGE_TTL`, Standard 60 s). **Keinen Parameter, der
+den Cache umgeht** — es gab einmal `?force=1`, aber es umging die Sperre nicht und
+versprach damit im wichtigsten Fall etwas, das es nicht halten konnte; außerhalb einer
+Sperre erhöhte es nur die Chance auf die Drosselung.
 
 Ein Minutentakt verliert nichts: die Auflösung des Backends beträgt einen Prozentpunkt,
 und im Leerlauf bewegt sich der Zähler nicht (MESSUNGEN.md §1).
@@ -188,8 +190,11 @@ war. Der Wrapper reagiert darauf so:
 
 - **Sperre nach einem Fehlschlag** (`Retry-After`, sonst `USAGE_FAILURE_BACKOFF`, Standard
   60 s, gedeckelt auf 15 min). Ohne sie löste jeder Consumer-Request einen neuen Versuch
-  aus und der Wrapper hielte ein 429 selbst am Leben. **`?force=1` umgeht die Sperre
-  nicht** — sonst wäre es genau dieser Umgehungsweg.
+  aus und der Wrapper hielte ein 429 selbst am Leben. Einen Umgehungsweg gibt es nicht.
+- **Der `503` nennt `Retry-After`** — als Header (RFC 9110) und als `error.retry_after` im
+  Body, wo eine Zeit bekannt ist. Es ist die **Rest**zeit der Sperre, nicht der
+  Ausgangswert der Gegenstelle. Ohne diese Angabe rät der Konsument: im Betrieb beobachtet
+  waren fünf Abrufe in drei Sekunden, was die Drosselung nur verlängert.
 - **Der letzte bekannte Stand wird weitergereicht**, markiert mit `stale: true` und
   `stale_reason`. Ein alter Füllstand ist brauchbar, solange klar ist, dass er alt ist.
 - **`503` nur, wenn es überhaupt keinen Stand gibt** — also bis zum ersten erfolgreichen
@@ -236,7 +241,7 @@ eine fehlende Zahl als 0 liest.
 ```
 einmal beim Start        GET /wire/v1/usage        Karte: welche Fenster, wem, wie voll
 laufend                  alle ~60 s pollen         Füllstände aktuell halten
-bei limit_status         GET /wire/v1/usage?force=1   frischer Stand, sofort
+nach 503                 Retry-After abwarten      frueher fragen bringt nichts
 ```
 
 Nachladen lohnt außerdem bei einem **unbekannten `window`**: dann kennt der Konsument ein

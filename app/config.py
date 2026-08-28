@@ -10,7 +10,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Die Version wird mit dem Git-Tag mitgeführt (ab 1.6.0; davor stand sie auf 1.3.2, während
 # die Tags schon bei 1.5.2 lagen — die Tags waren und bleiben die Wahrheit).
 SERVICE = "claude-wrapper-advanced"
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 
 def _truthy(v) -> bool:
