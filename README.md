@@ -4,8 +4,10 @@
 driven by your **Pro/Max subscription** instead of separate API credits.
 
 Endpoints: `/v1/chat/completions` and `/v1/responses` (both streaming + non-streaming), `/v1/models`,
-plus `/healthz` and `/metrics`.
-Design, rationale and the empirical findings live in [KONZEPT.md](KONZEPT.md).
+plus `/healthz` and `/metrics` — and `/wire/v1/*`, our own vocabulary for everything the OpenAI
+formats have no field for ([WIRE.md](WIRE.md)).
+Design and rationale live in [KONZEPT.md](KONZEPT.md), the runs behind the numbers in
+[MESSUNGEN.md](MESSUNGEN.md).
 
 ## Why "advanced"?
 
@@ -46,8 +48,12 @@ genuine drop-in OpenAI backend:
   pool bucket key. Tool-use survives (the contract lives in `tools[]`, not the prompt) and today's
   date reaches the model via a `<system-reminder>` in the user turn.
 - **Real usage & cost** — OpenAI `usage` plus an OpenRouter-style `cost`, with cache read/write token stats.
-- **Observability** — `/metrics` exposes latency bands (ttft / spawn / overhead), cache hit-rate and the
-  account-wide rate-limit status.
+- **Observability** — `/metrics` exposes latency bands (ttft / spawn / overhead), cache hit-rate and
+  every quota window the account has, each keeping its own last reading.
+- **Quota as a first-class surface** — `GET /wire/v1/usage` reports each window with its fill level
+  and, for a model-scoped one, which model it belongs to. A turn raises `limit_status` only when a
+  limit actually warns or bites; it carries no fill level, because the backend sends none
+  ([MESSUNGEN.md](MESSUNGEN.md) §4).
 - **Subscription-native & ToS-clean** — uses the official CLI login, never extracts tokens or touches the
   raw API. Ships as a non-root container with in-container login.
 
@@ -93,8 +99,10 @@ The terminal event is always `response.completed`, even when the status inside i
 WebUI's handler returns no metadata for it, so `usage` and the done signal are lost and the message
 never finishes. The status and `incomplete_details` are in the envelope either way.
 
-`usage` carries `output_tokens_details.reasoning_tokens` — the summed `estimated_tokens` from the
-CLI's thinking events, capped at `output_tokens` because it is an estimate, not a billed figure.
+`usage` carries `output_tokens_details.reasoning_tokens` — the real thinking-token count from the
+CLI's `message_delta` event where the turn produced one, and the summed `estimated_tokens` of the
+thinking events otherwise (an interrupted turn keeps the estimate). Measured on one turn: 490 real
+against 450 estimated. It stays capped at `output_tokens`, which matters for the estimated case.
 The chat endpoint reports the same under `completion_tokens_details.reasoning_tokens`. A truncated
 answer comes back as `status: "incomplete"` with `incomplete_details`, mirroring
 `finish_reason: "length"` on the chat side.
