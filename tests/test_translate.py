@@ -3,6 +3,7 @@
 Complements tests/assumptions.py: that one verifies what the *CLI* does (and costs tokens),
 this one verifies what *we* build before handing it over. Run: python -m unittest discover tests
 """
+import json
 import base64
 import unittest
 import zlib
@@ -446,6 +447,85 @@ class TestBuildSystemPrompt(unittest.TestCase):
         self.assertEqual(out[0]["function"]["name"], "get_weather")
         self.assertEqual(out[0]["function"]["arguments"], '{"city": "Berlin"}')
         self.assertTrue(out[0]["id"].startswith("call_"))
+
+    # --- Der __unparsedToolInput-Marker ---------------------------------------
+    #
+    # Claude Code legt Toolargumente, die es nicht als JSON lesen konnte, unter
+    # diesem Schlüssel ab. Wird der Marker wie ein normales Argumentobjekt
+    # serialisiert, entsteht *gültiges* JSON — der Client führt den Call aus und
+    # scheitert weit weg an einem fehlenden Pflichtfeld ("Error: 'pattern'")
+    # statt am eigentlichen Problem.
+
+    @staticmethod
+    def _sentinel(raw, length=None):
+        return {"__unparsedToolInput": {"raw": raw, "len": length if length is not None else len(raw)}}
+
+    def test_unparsed_input_is_handed_out_verbatim(self):
+        """Ungekürzt: der Originaltext geht unverändert nach außen."""
+        raw = '{"pattern": "foo", "include": wyai/src/**/*.py}'
+        out = tooluse_to_toolcalls([{"name": "grep", "input": self._sentinel(raw)}])
+        arguments = out[0]["function"]["arguments"]
+
+        self.assertEqual(arguments, raw)
+        self.assertNotIn("__unparsedToolInput", arguments)
+        # Der Client scheitert damit beim Parsen — an der richtigen Stelle.
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(arguments)
+
+    def test_truncated_unparsed_input_is_marked(self):
+        """Gekürzt: der Hinweis nennt beide Längen."""
+        raw = '{"pattern": "foo", "include": wyai/src/**'
+        out = tooluse_to_toolcalls([{"name": "grep", "input": self._sentinel(raw, length=9000)}])
+        arguments = out[0]["function"]["arguments"]
+
+        self.assertTrue(arguments.startswith(raw))
+        self.assertIn("9000 bytes", arguments)
+        self.assertIn(f"{len(raw)} shown", arguments)
+
+    def test_a_truncated_fragment_can_never_parse(self):
+        """Der eigentliche Grund für die Kennzeichnung.
+
+        Claude Code schneidet bei 2048 Zeichen ab. Fällt der Schnitt hinter eine
+        schließende Klammer, ist das Fragment für sich gültiges JSON — und würde
+        ohne Hinweis mit halben Argumenten ausgeführt.
+        """
+        raw = '{"pattern": "foo"}'                      # fuer sich gueltig
+        self.assertEqual(json.loads(raw), {"pattern": "foo"})   # Vorbedingung
+
+        out = tooluse_to_toolcalls([{"name": "grep", "input": self._sentinel(raw, length=5000)}])
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out[0]["function"]["arguments"])
+
+    def test_lookalike_objects_are_ordinary_arguments(self):
+        """Die Erkennung ist so eng wie die von Claude Code: genau ein Schlüssel,
+        `raw` als String, `len` als Zahl. Alles andere ist ein normales Objekt,
+        das zufällig so heißt — und wird auch so behandelt."""
+        lookalikes = [
+            # zweiter Schluessel daneben
+            {"__unparsedToolInput": {"raw": "x", "len": 1}, "pattern": "foo"},
+            # len fehlt
+            {"__unparsedToolInput": {"raw": "x"}},
+            # len ist keine Zahl
+            {"__unparsedToolInput": {"raw": "x", "len": "1"}},
+            # bool ist in Python ein int, hier aber ein Formfehler
+            {"__unparsedToolInput": {"raw": "x", "len": True}},
+            # raw ist keine Zeichenkette
+            {"__unparsedToolInput": {"raw": {"a": 1}, "len": 7}},
+            # Wert ist gar kein Objekt
+            {"__unparsedToolInput": "x"},
+        ]
+        for inp in lookalikes:
+            with self.subTest(inp=inp):
+                out = tooluse_to_toolcalls([{"name": "grep", "input": inp}])
+                arguments = out[0]["function"]["arguments"]
+                # Als normales Objekt serialisiert: parst, und traegt den Schluessel.
+                self.assertEqual(json.loads(arguments), inp)
+
+    def test_ordinary_input_is_untouched(self):
+        """Der Normalfall bleibt, wie er war."""
+        out = tooluse_to_toolcalls([{"name": "grep", "input": {"pattern": "foo", "include": ["*.py"]}}])
+        self.assertEqual(json.loads(out[0]["function"]["arguments"]),
+                         {"pattern": "foo", "include": ["*.py"]})
 
 
 if __name__ == "__main__":

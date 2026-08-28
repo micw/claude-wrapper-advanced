@@ -262,6 +262,32 @@ def openai_tools_to_mcp(tools):
     return out
 
 
+#: Markerschlüssel, unter dem Claude Code Toolargumente ablegt, die es nicht als
+#: JSON lesen konnte. Der Wert trägt `raw` (auf 2048 Zeichen gekürzter Originaltext)
+#: und `len` (dessen echte Länge).
+UNPARSED_TOOL_INPUT = "__unparsedToolInput"
+
+
+def _unparsed_tool_input(inp):
+    """Erkennt den Marker und gibt (raw, echte_länge) zurück, sonst None.
+
+    Die Prüfung ist absichtlich so eng wie die von Claude Code selbst: **genau
+    ein** Schlüssel, Wert ein Objekt mit `raw: str` und `len: int`. Alles andere
+    ist ein gewöhnliches Argumentobjekt, das zufällig so heißt — dann wird es
+    auch so behandelt, statt zu raten.
+    """
+    if not isinstance(inp, dict) or len(inp) != 1:
+        return None
+    marker = inp.get(UNPARSED_TOOL_INPUT)
+    if not isinstance(marker, dict):
+        return None
+    raw, length = marker.get("raw"), marker.get("len")
+    # bool ist in Python ein int — hier wäre er ein Formfehler, kein Länge.
+    if not isinstance(raw, str) or isinstance(length, bool) or not isinstance(length, int):
+        return None
+    return raw, length
+
+
 def tooluse_to_toolcalls(tool_use_blocks):
     """Native tool_use-Blöcke -> OpenAI tool_calls (Präfix mcp__t__ entfernen, args als JSON-String)."""
     out = []
@@ -274,10 +300,40 @@ def tooluse_to_toolcalls(tool_use_blocks):
             "type": "function",
             "function": {
                 "name": name,
-                "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False),
+                "arguments": _arguments_for(b.get("input") or {}),
             },
         })
     return out
+
+
+def _arguments_for(inp):
+    """`tool_use.input` -> der `arguments`-String eines OpenAI tool_calls.
+
+    Im Normalfall ist das schlicht das serialisierte Objekt. Der Sonderfall ist
+    der Marker aus [`UNPARSED_TOOL_INPUT`]: dann **hat es nie gültiges JSON
+    gegeben**, und der Originaltext gehört unverändert nach außen. Das ist
+    vertragsgemäß — bei OpenAI ist `arguments` ein String, der ungültiges JSON
+    enthalten *darf*, und jeder Client muss damit rechnen.
+
+    Den Marker als Objekt zu serialisieren wäre der Fehler: dabei entstünde
+    gültiges JSON, der Client führte den Call aus und scheiterte irgendwo tief
+    im Tool an einem fehlenden Pflichtfeld, statt am eigentlichen Problem.
+
+    **Gekürzte Fragmente werden ausdrücklich als solche gekennzeichnet.** Claude
+    Code schneidet `raw` bei 2048 Zeichen ab; ein so entstandenes Fragment kann
+    für sich genommen wieder gültiges JSON sein (`{"a": 1}` gefolgt von Müll,
+    hinter dem Schnitt). Ohne Kennzeichnung würde es still und mit halben
+    Argumenten ausgeführt. Der angehängte Hinweis verhindert das zweifach: er
+    macht das Fragment sichtbar unvollständig und garantiert, dass es nicht
+    mehr parst. Der Wortlaut ist der von Claude Code selbst.
+    """
+    unparsed = _unparsed_tool_input(inp)
+    if unparsed is None:
+        return json.dumps(inp, ensure_ascii=False)
+    raw, length = unparsed
+    if length > len(raw):
+        return f"{raw}\n/* input JSON failed to parse — {length} bytes, {len(raw)} shown */"
+    return raw
 
 
 class ApiError(Exception):

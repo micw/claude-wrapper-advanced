@@ -274,6 +274,15 @@ Always run the curl quick test before testing in the editor.
   beyond the limit still ends the turn (the buffer is unrecoverable), but as an `overlong_line`
   error event, not as a truncated response body.
 - Per-request `cost` in `usage` is distorted for tool-call turns (cumulative cost is correct); see the pool notes in the code.
+- **A model can emit tool arguments that are not JSON**, and the CLI then hands us
+  `{"__unparsedToolInput": {"raw": "…", "len": N}}` instead of the arguments. That marker is
+  *not* forwarded as an argument object — doing so produces valid JSON, the client executes
+  the call and fails deep inside the tool on a missing field (`Error: 'pattern'`) rather than
+  on the real problem. Instead the original text goes out verbatim as `arguments`, which is
+  contract-conform: OpenAI's `arguments` is a string that *may* contain invalid JSON, and every
+  client has to handle that. `raw` is truncated at 2048 characters by the CLI, so a fragment
+  that happens to parse on its own gets an explicit `/* input JSON failed to parse — N bytes,
+  M shown */` appended: it must never be executed as if it were the whole call.
 
 ## Assumption tests
 
