@@ -63,7 +63,7 @@ class Backoff(unittest.IsolatedAsyncioTestCase):
         import urllib.error
         http_err = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "99999"}, None)
         with mock.patch.object(limits.urllib.request, "urlopen", side_effect=http_err), \
-                mock.patch.object(limits, "_token", return_value="x"):
+                mock.patch.object(limits, "_token", return_value=("x", "test")):
             with self.assertRaises(limits.UsageUnavailable) as cm:
                 limits._fetch_sync()
         self.assertEqual(cm.exception.retry_after, limits.MAX_BACKOFF)

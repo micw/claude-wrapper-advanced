@@ -210,12 +210,20 @@ def classify(m, stats, mark_ttft, model=None):
                 stats["usage"] = _usage_obj(msg["usage"])
                 stats["usage_raw"] = msg["usage"]
             stats["outcome"] = "tool_call"
+            stats["stop_reason"] = "tool_use"
             # Normalisiert (mcp__t__-Präfix weg, Argumente als JSON-String) — dieselbe
             # Form, die die OpenAI-Oberflächen brauchen, hier einmal statt zweimal.
             calls = tooluse_to_toolcalls(tus)
-            return [wire.ToolCall(id=call["id"], name=call["function"]["name"],
-                                  arguments=call["function"]["arguments"], _raw=raw)
-                    for call, raw in zip(calls, tus)]
+            tool_events = [
+                # Native Wire keeps the backend id. The OpenAI adapter below still creates
+                # its own call id from `_raw`, so this does not alter the compatibility API.
+                wire.ToolCall(id=raw.get("id") or call["id"], name=call["function"]["name"],
+                              arguments=call["function"]["arguments"], _raw=raw)
+                for call, raw in zip(calls, tus)
+            ]
+            # A tool call ends this CLI turn just as a result does. Keep all terminal data in
+            # Done; in particular message_start/assistant usage must not disappear here.
+            return [*tool_events, _done(stats, "")]
         return []
     if t == "result":
         mark_ttft()
@@ -405,6 +413,10 @@ async def drive_turn(prompt, mcp_tools, model, stats, effort=None, system_prompt
         if pending:
             yield ("tool_use", pending)
             pending = []
+            # Native Wire has a real terminal Done after a tool call. The legacy tuple API
+            # represented that terminal solely by tool_use and must not gain an empty result.
+            if isinstance(event, wire.Done) and event.stop_reason == "tool_use":
+                continue
         if isinstance(event, wire.TextDelta):
             yield ("delta", event.text)
         elif isinstance(event, wire.ThinkingProgress):

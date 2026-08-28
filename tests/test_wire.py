@@ -110,11 +110,17 @@ class Vocabulary(unittest.TestCase):
         self.assertEqual(stats["thinking_tokens"], 200)
 
     def test_tool_call_is_normalised(self):
-        event = only(TOOL_USE)[0]
+        events = only(TOOL_USE)
+        event = events[0]
         self.assertEqual(event.type, "tool_call")
+        self.assertEqual(event.id, "toolu_1", "native Wire muss die Backend-ID behalten")
         self.assertEqual(event.name, "get_weather", "mcp__t__-Präfix muss weg")
         self.assertEqual(json.loads(event.arguments), {"city": "Berlin"})
         self.assertNotIn("_raw", event.payload(), "internes Feld darf nicht nach außen")
+        done = events[1]
+        self.assertEqual(done.type, "done")
+        self.assertEqual(done.stop_reason, "tool_use")
+        self.assertEqual(done.usage["input_total"], 10)
 
     def test_failure_keeps_the_upstream_status(self):
         event = only(MODEL_ERROR)[0]

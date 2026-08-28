@@ -47,10 +47,31 @@ data: {"type":"done","stop_reason":"end_turn","text":"OK","usage":{…},"cost":{
 | `started` | `model`, `reused` | `reused` ist die einzige Stelle, an der die Prozess-Natur nach außen sichtbar wird |
 | `text_delta` | `text` | |
 | `thinking_progress` | `tokens` | **kein Text** — die CLI redigiert ihn (MESSUNGEN.md §3) |
-| `tool_call` | `id`, `name`, `arguments` | `arguments` ist ein JSON-**String**, wie die CLI ihn liefert; höchstens einer pro Turn |
-| `limit_status` | `window`, `claim`, `status`, `resets_at`, `overage`, `usage_stale` | nur im Alarmfall, s.u. |
-| `done` | `stop_reason`, `text`, `usage`, `cost`, `timing` | sauberes Ende |
+| `tool_call` | `id`, `name`, `arguments` | `id` ist die **Backend-Kennung** (`toolu_…`), `arguments` ein JSON-**String**, wie die CLI ihn liefert; höchstens einer pro Turn |
+| `limit_status` | `window`, `claim`, `status`, `resets_at`, `surpassed_threshold`, `overage`, `usage_stale` | nur im Alarmfall, s.u. |
+| `done` | `stop_reason`, `text`, `usage`, `cost`, `timing` | sauberes Ende — **auch nach einem Tool-Call**, s.u. |
 | `failed` | `error_type`, `message`, `upstream_status`, `retryable` | getrennt von `done`, weil Fehler und Ende zwei Fälle sind |
+
+### Jeder Turn endet mit `done` oder `failed` — auch ein Tool-Turn
+
+Ein Tool-Turn schließt mit
+
+```json
+{"type":"done","stop_reason":"tool_use","text":"","usage":{…},"cost":{…},"timing":{…}}
+```
+
+Das ist nicht kosmetisch: die CLI schickt bei einem Tool-Call **kein** `result`-Ereignis,
+die Usage steht dort nur in `message_start` und in der assistant-Message. Ohne dieses
+`done` verlöre ein Wire-Konsument die Tokenzahlen jedes Tool-Turns — und in einer
+Agentenschleife ist das die Mehrzahl aller Turns.
+
+`cost.total_usd` ist dabei `null`: `total_cost_usd` liefert die CLI nur im `result`, der
+Kostenanteil eines Tool-Turns erscheint deshalb erst im nächsten vollen Turn. Kumulativ
+korrekt, pro Turn verschoben — bekannt und nicht behebbar, solange die CLI es so meldet.
+
+Der Tupel-Adapter für die OpenAI-Oberflächen unterdrückt dieses `done`: dort ist der
+Tool-Call selbst der Abschluss, und ein zusätzliches leeres Ergebnis würde an jedem
+Tool-Call eine leere Antwort erzeugen. `tests/test_legacy_adapter.py` nagelt das fest.
 
 ### `usage` im `done`
 

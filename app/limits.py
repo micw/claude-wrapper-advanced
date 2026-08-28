@@ -254,21 +254,33 @@ def status_from_event(info, model=None):
 # ------------------------------------------------------------------- Abruf
 
 def _token():
-    """OAuth-Token der CLI. Env schlägt Credential-Datei (Container-Setup)."""
+    """OAuth-Token der CLI plus die Quelle. Env schlägt Credential-Datei (Container-Setup).
+
+    Die Quelle wird mitgegeben, weil sie im Fehlerfall die entscheidende Auskunft ist: ein
+    langlebiger `setup-token` und die Anmeldung aus dem Login-Volume sind verschiedene
+    Dinge, und von außen sieht man nur den Statuscode.
+    """
     token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
     if token:
-        return token.strip()
+        return token.strip(), "CLAUDE_CODE_OAUTH_TOKEN"
     base = os.getenv("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     path = os.path.join(base, ".credentials.json")
     try:
         with open(path) as fh:
-            return (json.load(fh).get("claudeAiOauth") or {}).get("accessToken")
+            data = (json.load(fh).get("claudeAiOauth") or {})
     except (OSError, ValueError) as err:
         raise UsageUnavailable(f"no OAuth token: {err}") from None
+    # Ablaufzeitpunkt nur zur Diagnose: erneuert wird hier nichts, das macht die CLI beim
+    # nächsten Turn. Ein abgelaufener Token erklärt aber einen Fehler, den man sonst rät.
+    expired = ""
+    expires_at = data.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and expires_at / 1000 < time.time():
+        expired = ", ABGELAUFEN"
+    return data.get("accessToken"), f"{path}{expired}"
 
 
 def _fetch_sync():
-    token = _token()
+    token, source = _token()
     if not token:
         raise UsageUnavailable("no OAuth token in env or credential store")
     request = urllib.request.Request(USAGE_URL, headers={
@@ -288,6 +300,17 @@ def _fetch_sync():
             retry = min(float(raw), MAX_BACKOFF) if raw else None
         except (TypeError, ValueError):
             retry = None
+        # Ins LOG, nicht in die Antwort: Token-Quelle und der Wortlaut der Gegenstelle sind
+        # Betriebsdiagnose. Von außen ist ein 429 sonst nicht von einem anderen zu
+        # unterscheiden — Token abgelaufen, falscher Token-Typ oder wirklich zu viele
+        # Anfragen sehen alle gleich aus.
+        detail = ""
+        try:
+            detail = (err.read() or b"")[:300].decode(errors="replace")
+        except Exception:  # noqa: BLE001 — Diagnose darf den Fehlerpfad nie ersetzen
+            detail = "(kein Body)"
+        log.warning("usage fetch: upstream %s (token aus %s, retry_after=%s): %s",
+                    err.code, source, retry, detail)
         raise UsageUnavailable(f"upstream {err.code}", retry_after=retry) from None
     except (urllib.error.URLError, OSError, ValueError) as err:
         raise UsageUnavailable(str(err)) from None
