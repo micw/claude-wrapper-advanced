@@ -27,18 +27,53 @@ class Metrics:
         self.cache_read = 0
         self.cache_write = 0
         self.prompt_toks = 0
-        # Letzter Rate-Limit-Stand (account-weit, aus rate_limit_event)
-        self.rate_limit = None
+        # Kontingent, pro Gruppe akkumuliert (aus rate_limit_event). Siehe update_rate_limit().
+        self.limit_groups = {}
+        self.limit_state = None
 
     def update_rate_limit(self, info):
+        """Ein rate_limit_event einsortieren.
+
+        Je Turn nennt das Backend GENAU EIN Fenster (`rateLimitType`, aus dem Header
+        `anthropic-ratelimit-unified-representative-claim`). Welches, entscheidet es selbst —
+        gemessen kam `five_hour`, während das Wochenfenster mit 72 % deutlich voller war. Der
+        Wert ist also NICHT "die Gruppe, die dieser Turn belastet hat"; er heißt hier deshalb
+        representative_claim und nicht active_group.
+
+        Daraus folgt die Akkumulation: ein einzelner Slot würde den five_hour-Stand verwerfen,
+        sobald einmal ein seven_day-Ereignis kommt. Jede Gruppe behält ihren eigenen letzten
+        Stand, mit eigenem Zeitstempel — ein alter Wert ist eine Information, ein
+        überschriebener ist keine.
+
+        `utilization` fehlt im Normalfall: das Backend schickt es nur bei `allowed_warning`
+        und beim 429 (gemessen). Der Füllstand kommt aus GET /api/oauth/usage, nicht von hier.
+        """
         if not info:
             return
-        self.rate_limit = {
+        now = int(time.time())
+        kind = info.get("rateLimitType")
+        if kind:
+            util = info.get("utilization")
+            self.limit_groups[kind] = {
+                "status": info.get("status"),
+                # utilization kommt als Bruch 0..1; die Usage-API liefert Prozent. Hier wird
+                # auf Prozent normalisiert, damit beide Quellen dieselbe Einheit sprechen.
+                "used_percent": round(util * 100, 2) if isinstance(util, (int, float)) else None,
+                "resets_at": info.get("resetsAt"),
+                "reached": info.get("status") == "rejected",
+                "updated_at": now,
+            }
+        self.limit_state = {
+            "representative_claim": kind,
             "status": info.get("status"),
-            "type": info.get("rateLimitType"),
-            "resets_at": info.get("resetsAt"),
-            "using_overage": info.get("isUsingOverage"),
-            "updated_at": int(time.time()),
+            "surpassed_threshold": info.get("surpassedThreshold"),
+            "overage": {
+                "status": info.get("overageStatus"),
+                "in_use": info.get("isUsingOverage"),
+                "disabled_reason": info.get("overageDisabledReason"),
+                "error_code": info.get("errorCode"),
+            },
+            "updated_at": now,
         }
 
     def start(self):
@@ -68,11 +103,16 @@ class Metrics:
         done = sum(self.counts.values())
         errors = self.counts.get("timeout", 0) + self.counts.get("error", 0)
 
-        rl = None
-        if self.rate_limit:
-            rl = dict(self.rate_limit)
-            if rl.get("resets_at"):
-                rl["resets_in_s"] = max(0, rl["resets_at"] - int(time.time()))
+        limits = None
+        if self.limit_state:
+            now = int(time.time())
+            groups = {}
+            for kind, g in self.limit_groups.items():
+                g = dict(g)
+                if g.get("resets_at"):
+                    g["resets_in_s"] = max(0, g["resets_at"] - now)
+                groups[kind] = g
+            limits = {**self.limit_state, "groups": groups}
 
         def band(d):
             s = sorted(d)
@@ -97,7 +137,9 @@ class Metrics:
                 "cli_internal": band(self.cli_dur),  # CLI-eigene Messung
                 "overhead": band(self.overhead),     # total - cli_internal = pool-sparbar
             },
-            "rate_limit": rl,   # account-weit: status/type/resets_in_s (aus rate_limit_event)
+            # Kontingent: pro Gruppe der letzte bekannte Stand, dazu der zuletzt gemeldete
+            # Gesamtzustand. Füllstände nur, wo das Backend sie mitschickt (Warnung/429).
+            "limits": limits,
         }
 
 

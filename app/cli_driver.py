@@ -127,6 +127,16 @@ def classify(m, stats, mark_ttft):
         return None
     if t == "stream_event":
         ev = m.get("event") or {}
+        # message_delta trägt die ECHTE Denk-Token-Zahl (output_tokens_details.thinking_tokens);
+        # sie steht weder im result-Event noch in dessen usage. Gemessen: 490 echt gegen 450
+        # aus der Schätzsumme unten — die Schätzung ist brauchbar, aber sie ist eine Schätzung.
+        if ev.get("type") == "message_delta":
+            det = ((ev.get("usage") or {}).get("output_tokens_details") or {})
+            real = det.get("thinking_tokens")
+            if real is not None:
+                stats["thinking_tokens"] = real
+                stats["thinking_tokens_source"] = "api"
+            return None
         if ev.get("type") == "content_block_delta":
             d = ev.get("delta") or {}
             if d.get("type") == "text_delta" and d.get("text"):
@@ -138,7 +148,12 @@ def classify(m, stats, mark_ttft):
                 est = d.get("estimated_tokens") or 0
                 # Hier mitzählen (nicht erst im Endpunkt): so steht die Zahl beiden Endpunkten
                 # und auch dem Non-Streaming-Pfad zur Verfügung, unabhängig von STREAM_THINKING.
-                stats["thinking_tokens"] = stats.get("thinking_tokens", 0) + est
+                acc = stats.get("thinking_tokens_estimated", 0) + est
+                stats["thinking_tokens_estimated"] = acc
+                # Fallback, solange die echte Zahl nicht da ist (message_delta kommt zum Schluss).
+                # Ein abgebrochener Turn behält so wenigstens die Schätzung.
+                if stats.get("thinking_tokens_source") != "api":
+                    stats["thinking_tokens"] = acc
                 return ("thinking", est)
         return None
     if t == "assistant":
