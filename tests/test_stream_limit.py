@@ -25,9 +25,15 @@ import sys
 import unittest
 from unittest import mock
 
+from app import wire
 from app.cli_driver import Overlong, Silent, read_line, spawn_cli, _oneshot_turn
 from app.config import settings
 from app.pool import Proc
+
+
+def kinds(events):
+    """Ereignistypen ohne 'started' — das eröffnet jeden Turn und sagt über den Ausgang nichts."""
+    return [e.type for e in events if not isinstance(e, wire.Started)]
 
 
 # 64 KiB is the asyncio default we are escaping; use a line comfortably above it.
@@ -176,8 +182,8 @@ class TestTurnLoops(unittest.IsolatedAsyncioTestCase):
         stats = {}
         with self.assertLogs("pool", "ERROR"):    # the operator must see WHY the turn died
             evs = [ev async for ev in p.run_turn("hi", stats)]
-        self.assertEqual([e[0] for e in evs], ["error"])
-        self.assertEqual(evs[0][1]["type"], "overlong_line")
+        self.assertEqual(kinds(evs), ["failed"])
+        self.assertEqual(evs[-1].error_type, "overlong_line")
         self.assertEqual(stats.get("outcome"), "error")
 
     async def test_pooled_proc_is_discarded_afterwards(self):
@@ -195,7 +201,7 @@ class TestTurnLoops(unittest.IsolatedAsyncioTestCase):
         p.proc = FakeProc([_overrun()])           # the overrun hits the /clear read
         stats = {}
         evs = [ev async for ev in p.run_turn("hi", stats)]
-        self.assertEqual([e[0] for e in evs], ["error"])
+        self.assertEqual(kinds(evs), ["failed"])
         self.assertTrue(p.dead)
         self.assertEqual(stats.get("outcome"), "error")
 
@@ -206,8 +212,8 @@ class TestTurnLoops(unittest.IsolatedAsyncioTestCase):
         with mock.patch("app.cli_driver.spawn_cli", return_value=fake), \
                 self.assertLogs("cli", "ERROR"):
             evs = [ev async for ev in _oneshot_turn("hi", [], "claude-opus-5", stats)]
-        self.assertEqual([e[0] for e in evs], ["error"])
-        self.assertEqual(evs[0][1]["type"], "overlong_line")
+        self.assertEqual(kinds(evs), ["failed"])
+        self.assertEqual(evs[-1].error_type, "overlong_line")
         self.assertEqual(stats.get("outcome"), "error")
         self.assertTrue(fake.killed, "the one-shot process must be reaped")
 

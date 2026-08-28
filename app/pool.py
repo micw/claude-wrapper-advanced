@@ -13,9 +13,10 @@ import logging
 import time
 from collections import defaultdict, deque
 
+from . import wire
 from .config import settings
-from .cli_driver import (_build_args, _overlong_evt, _timeout_evt, Overlong, Silent,
-                         classify, read_line, spawn_cli)
+from .cli_driver import (_build_args, _done, _overlong_evt, _timeout_evt, Overlong, Silent,
+                         TERMINAL, classify, read_line, spawn_cli)
 
 log = logging.getLogger("pool")
 
@@ -43,9 +44,12 @@ _INTERRUPT = {"type": "control_request", "request_id": "i", "request": {"subtype
 
 
 class Proc:
-    def __init__(self, key, args):
+    def __init__(self, key, args, model=None):
         self.key = key
         self.args = args
+        # Nur zur Beschriftung: der Fensterschlüssel eines LimitStatus braucht das Modell
+        # des Turns, und das weiß sonst niemand im Strom (MESSUNGEN.md §6).
+        self.model = model
         self.proc = None
         self.stderr_tail = deque(maxlen=50)
         self._err_task = None
@@ -120,8 +124,11 @@ class Proc:
         except (asyncio.TimeoutError, EOFError, Overlong):
             self.dead = True
             stats["outcome"] = "error"
-            yield ("error", {"type": "cli_exit", "message": "pooled proc unresponsive on /clear"})
+            yield wire.Failed(error_type="cli_exit",
+                              message="pooled proc unresponsive on /clear")
             return
+
+        yield wire.Started(model=self.model, reused=stats.get("reused", False))
 
         await self._send(_user_msg(prompt))
 
@@ -156,44 +163,51 @@ class Proc:
                     stats["outcome"] = "error"
                     tail = "\n".join(self.stderr_tail)
                     log.error("pooled proc died mid-turn. stderr:\n%s", tail or "(leer)")
-                    yield ("error", {"type": "cli_exit", "message": tail[-500:] or "proc exited"})
+                    yield wire.Failed(error_type="cli_exit",
+                                      message=tail[-500:] or "proc exited")
                     return
                 try:
                     m = json.loads(raw)
                 except Exception:
                     continue
-                ev = classify(m, stats, mark)
-                if ev is None:
+                events = classify(m, stats, mark, self.model)
+                if not events:
                     continue
-                kind = ev[0]
-                if kind in ("delta", "thinking"):   # thinking MUSS hier rein — sonst fiele es
-                    yield ev                        # in den else-Zweig und würde den Turn beenden
-                elif kind == "tool_use":
+                if any(isinstance(e, wire.ToolCall) for e in events):
                     # Turn abbrechen (Prozess bleibt am Leben), Client bekommt den Call sofort.
                     # Known limitation: total_cost_usd steht NUR im result-Event, nicht in der
                     # assistant-Message -> die (nominalen) Kosten dieses Tool-Turns erscheinen erst
                     # im Delta des nächsten vollen Turns. Per-Request-cost bei Tool-Paaren also
                     # verzerrt (kumulativ korrekt). Egal solange Abo/Usage-Limit statt echter Abrechnung.
                     await self._send(_INTERRUPT)
-                    yield ev
+                    for event in events:
+                        yield event
                     await self._drain_after_interrupt()
                     return
-                else:  # result / error
-                    # Kumulative CLI-Kosten -> Per-Turn-Delta umrechnen.
-                    if ev[0] == "result" and stats.get("cost_usd") is not None:
-                        total_cost = stats["cost_usd"]
-                        if total_cost < self._cum_cost:
-                            # Sollte nicht passieren: total_cost_usd ist pro Prozess kumulativ und
-                            # überlebt /clear (siehe cost.cumulative in tests/assumptions.py). Wenn
-                            # die CLI das ändert, liefert die Delta-Rechnung ab hier stumm 0.0 —
-                            # das darf nicht unbemerkt bleiben.
-                            log.warning("total_cost_usd fiel von %s auf %s — Kumulativ-Annahme "
-                                        "verletzt, per-Request-cost ist ab jetzt unbrauchbar",
-                                        self._cum_cost, total_cost)
-                        stats["cost_usd"] = max(0.0, total_cost - self._cum_cost)
-                        self._cum_cost = max(self._cum_cost, total_cost)
-                    yield ev
-                    return
+                terminal = next((e for e in events if isinstance(e, TERMINAL)), None)
+                if terminal is None:
+                    for event in events:   # Deltas, Denkfortschritt, Kontingent-Alarm
+                        yield event
+                    continue
+                # Kumulative CLI-Kosten -> Per-Turn-Delta umrechnen.
+                if isinstance(terminal, wire.Done) and stats.get("cost_usd") is not None:
+                    total_cost = stats["cost_usd"]
+                    if total_cost < self._cum_cost:
+                        # Sollte nicht passieren: total_cost_usd ist pro Prozess kumulativ und
+                        # überlebt /clear (siehe cost.cumulative in tests/assumptions.py). Wenn
+                        # die CLI das ändert, liefert die Delta-Rechnung ab hier stumm 0.0 —
+                        # das darf nicht unbemerkt bleiben.
+                        log.warning("total_cost_usd fiel von %s auf %s — Kumulativ-Annahme "
+                                    "verletzt, per-Request-cost ist ab jetzt unbrauchbar",
+                                    self._cum_cost, total_cost)
+                    stats["cost_usd"] = max(0.0, total_cost - self._cum_cost)
+                    self._cum_cost = max(self._cum_cost, total_cost)
+                    # Das Ereignis trägt die Kosten IN sich — nach der Delta-Rechnung neu
+                    # bauen, sonst nennt es den kumulativen Wert des Prozesses.
+                    terminal = _done(stats, terminal.text)
+                for event in events:
+                    yield terminal if isinstance(event, TERMINAL) else event
+                return
         finally:
             self.last_used = time.monotonic()
 
@@ -242,7 +256,7 @@ class Pool:
                 await self.cond.wait()  # alles busy -> auf Freigabe warten
 
         # Spawn außerhalb des Locks (Init ~0.8s soll andere nicht blockieren).
-        p = Proc(key, args)
+        p = Proc(key, args, model)
         try:
             await p.start()
         except BaseException:
@@ -320,6 +334,7 @@ async def pooled_drive_turn(prompt, mcp_tools, model, stats, effort=None, system
     # Bis zu 2 Versuche: eine idle gecrashte Instanz kann trotz Liveness-Check im Race
     # sterben. Retry ist nur sicher, SOLANGE noch nichts an den Client geflossen ist
     # (bei Streaming kann man Teil-Output nicht zurücknehmen).
+    started_sent = False
     for attempt in (1, 2):
         t_acq = time.perf_counter()
         key, p, reused = await pool.acquire(model, mcp_tools, effort, system_prompt, append_system)
@@ -337,12 +352,21 @@ async def pooled_drive_turn(prompt, mcp_tools, model, stats, effort=None, system
                 except StopAsyncIteration:
                     completed = True
                     break
-                # Toter Prozess VOR dem ersten Event -> transparent auf frische Instanz ausweichen.
+                # Toter Prozess VOR dem ersten Event -> transparent auf frische Instanz
+                # ausweichen. `Started` zählt dabei nicht als Ausgabe: es trägt keinen
+                # Inhalt, der sich nicht zurücknehmen ließe.
                 if (attempt == 1 and not yielded_any
-                        and ev[0] == "error" and ev[1].get("type") == "cli_exit"):
+                        and isinstance(ev, wire.Failed) and ev.error_type == "cli_exit"):
                     retry = True
                     break
-                yielded_any = True
+                if isinstance(ev, wire.Started):
+                    # Der zweite Versuch spawnt neu und meldet erneut Start — nach außen
+                    # ist es derselbe Turn, also nur einmal.
+                    if started_sent:
+                        continue
+                    started_sent = True
+                else:
+                    yielded_any = True
                 yield ev
         finally:
             with contextlib.suppress(Exception):

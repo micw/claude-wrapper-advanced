@@ -1,13 +1,17 @@
 """Treibt die Claude Code CLI. Dispatcht auf Pool (Reuse) oder One-Shot.
 
-Events (async-generator), einheitlich für beide Modi:
-  ("delta", text)          - Text-Token
-  ("tool_use", blocks)     - nativer Tool-Call
-  ("result", text)         - finale Antwort
-  ("error", {type,message})- Timeout / CLI-Fehler / unerwartetes Ende
+Der Strom besteht aus Wire-Ereignissen (`app/wire.py`), einheitlich für beide Modi:
+`Started`, `TextDelta`, `ThinkingProgress`, `ToolCall`, `LimitStatus`, `Done`, `Failed`.
+Die Abschlussdaten — Usage, Kosten, Zeiten — stehen **im** `Done`-Ereignis.
 
-`stats` wird befüllt: spawn_ms, ttft_ms, outcome, reused, usage, cost_usd,
-stop_reason, cli_duration_ms, cli_ttft_ms, num_turns, stderr_tail.
+`drive_turn_events()` liefert diesen Strom. `drive_turn()` daneben ist der Adapter auf
+die alten Tupel, solange die OpenAI-Oberflächen in `main.py` noch daraus gebaut werden;
+er entfällt mit deren Umstellung.
+
+`stats` wird weiter befüllt (spawn_ms, ttft_ms, outcome, reused, usage, cost_usd,
+stop_reason, cli_duration_ms, num_turns, stderr_tail) — der Pool braucht es für die
+Kosten-Delta-Rechnung, und `/metrics` liest daraus. Neu ist, dass kein Konsument mehr
+darauf angewiesen ist: was ein Turn abschließend zu sagen hat, steht im Ereignis.
 """
 import asyncio
 import contextlib
@@ -19,8 +23,10 @@ import time
 from collections import deque
 from pathlib import Path
 
+from . import limits, wire
 from .config import settings
 from .metrics import metrics
+from .translate import tooluse_to_toolcalls
 
 log = logging.getLogger("cli")
 _MCP_SERVER = str(Path(__file__).parent / "mcp_tool_server.py")
@@ -108,15 +114,40 @@ def _usage_obj(u):
 
 def _capture_result(m, stats):
     stats["usage"] = _usage_obj(m.get("usage"))
+    stats["usage_raw"] = m.get("usage") or {}
     stats["cost_usd"] = m.get("total_cost_usd")
+    # Aufschlüsselung pro Modell. Enthält gemessen auch CLI-interne Nebenaufrufe
+    # (Haiku), ist also der einzige Weg, die Kosten des Modell-Turns zu isolieren.
+    stats["model_usage"] = m.get("modelUsage") or {}
     stats["stop_reason"] = m.get("stop_reason")
     stats["cli_duration_ms"] = m.get("duration_ms")
     stats["cli_ttft_ms"] = m.get("ttft_ms")
     stats["num_turns"] = m.get("num_turns")
 
 
-def classify(m, stats, mark_ttft):
-    """Eine stream-json-Zeile -> Event-Tupel oder None. Befüllt stats."""
+def _done(stats, text):
+    """Das Abschlussereignis aus dem, was der Turn gesammelt hat."""
+    return wire.Done(
+        stop_reason=stats.get("stop_reason"),
+        text=text,
+        usage=wire.usage(stats.get("usage_raw"), stats.get("thinking_tokens")),
+        cost=wire.cost(stats.get("cost_usd"), stats.get("model_usage")),
+        timing={
+            "cli_ms": stats.get("cli_duration_ms"),
+            "ttft_ms": stats.get("ttft_ms"),
+            "spawn_ms": stats.get("spawn_ms"),
+            "reused": stats.get("reused"),
+        },
+    )
+
+
+def classify(m, stats, mark_ttft, model=None):
+    """Eine stream-json-Zeile -> Liste von Wire-Ereignissen (oft leer). Befüllt stats.
+
+    Eine Liste, weil eine einzelne assistant-Zeile mehrere `tool_use`-Blöcke tragen kann.
+    `model` wird für den Fensterschlüssel eines `LimitStatus` gebraucht — der Wrapper ist
+    die einzige Stelle, die weiß, auf welchem Modell der Turn lief (MESSUNGEN.md §6).
+    """
     t = m.get("type")
     if t == "rate_limit_event":
         info = m.get("rate_limit_info") or {}
@@ -124,24 +155,36 @@ def classify(m, stats, mark_ttft):
         if info.get("status") and info.get("status") != "allowed":
             log.warning("rate limit status=%s type=%s resetsAt=%s",
                         info.get("status"), info.get("rateLimitType"), info.get("resetsAt"))
-        return None
+        # Nur wenn etwas anliegt: der Normalfall wäre ein Ereignis pro Turn ohne Inhalt.
+        status = limits.status_from_event(info, model)
+        return [wire.LimitStatus(**status)] if status else []
     if t == "stream_event":
         ev = m.get("event") or {}
+        kind = ev.get("type")
+        # Die Input-Seite steht schon vor dem ersten Token fest. Für Turns, die mit einem
+        # Tool-Call enden, ist das die einzige vollständige Usage-Quelle — ein
+        # result-Ereignis kommt dort nie.
+        if kind == "message_start":
+            stats.setdefault("usage_raw", (ev.get("message") or {}).get("usage") or {})
+            return []
         # message_delta trägt die ECHTE Denk-Token-Zahl (output_tokens_details.thinking_tokens);
         # sie steht weder im result-Event noch in dessen usage. Gemessen: 490 echt gegen 450
         # aus der Schätzsumme unten — die Schätzung ist brauchbar, aber sie ist eine Schätzung.
-        if ev.get("type") == "message_delta":
-            det = ((ev.get("usage") or {}).get("output_tokens_details") or {})
+        if kind == "message_delta":
+            usage = ev.get("usage") or {}
+            det = usage.get("output_tokens_details") or {}
             real = det.get("thinking_tokens")
             if real is not None:
                 stats["thinking_tokens"] = real
                 stats["thinking_tokens_source"] = "api"
-            return None
-        if ev.get("type") == "content_block_delta":
+            if usage:
+                stats["usage_raw"] = {**(stats.get("usage_raw") or {}), **usage}
+            return []
+        if kind == "content_block_delta":
             d = ev.get("delta") or {}
             if d.get("type") == "text_delta" and d.get("text"):
                 mark_ttft()
-                return ("delta", d["text"])
+                return [wire.TextDelta(text=d["text"])]
             if d.get("type") == "thinking_delta":
                 # KEIN mark_ttft(): ttft bleibt "erstes Text-Token", sonst sind die Latenz-
                 # Metriken nicht mehr mit früheren Läufen vergleichbar.
@@ -154,8 +197,8 @@ def classify(m, stats, mark_ttft):
                 # Ein abgebrochener Turn behält so wenigstens die Schätzung.
                 if stats.get("thinking_tokens_source") != "api":
                     stats["thinking_tokens"] = acc
-                return ("thinking", est)
-        return None
+                return [wire.ThinkingProgress(tokens=est)]
+        return []
     if t == "assistant":
         blocks = (m.get("message") or {}).get("content") or []
         tus = [b for b in blocks if b.get("type") == "tool_use"]
@@ -165,9 +208,15 @@ def classify(m, stats, mark_ttft):
             msg = m.get("message") or {}
             if msg.get("usage"):
                 stats["usage"] = _usage_obj(msg["usage"])
+                stats["usage_raw"] = msg["usage"]
             stats["outcome"] = "tool_call"
-            return ("tool_use", tus)
-        return None
+            # Normalisiert (mcp__t__-Präfix weg, Argumente als JSON-String) — dieselbe
+            # Form, die die OpenAI-Oberflächen brauchen, hier einmal statt zweimal.
+            calls = tooluse_to_toolcalls(tus)
+            return [wire.ToolCall(id=call["id"], name=call["function"]["name"],
+                                  arguments=call["function"]["arguments"], _raw=raw)
+                    for call, raw in zip(calls, tus)]
+        return []
     if t == "result":
         mark_ttft()
         _capture_result(m, stats)
@@ -175,12 +224,12 @@ def classify(m, stats, mark_ttft):
             stats["outcome"] = "error"
             # Achtung: 'subtype' steht auch im Fehlerfall auf "success" — nur is_error zählt.
             # api_error_status trägt den echten Upstream-Status (z.B. 404 bei Modellfehlern).
-            return ("error", {"type": "cli_error",
-                              "message": (m.get("result") or m.get("subtype") or "cli error"),
-                              "status": m.get("api_error_status")})
+            return [wire.Failed(error_type="cli_error",
+                                message=(m.get("result") or m.get("subtype") or "cli error"),
+                                upstream_status=m.get("api_error_status"))]
         stats["outcome"] = "final"
-        return ("result", m.get("result") or "")
-    return None
+        return [_done(stats, m.get("result") or "")]
+    return []
 
 
 async def spawn_cli(args):
@@ -231,15 +280,20 @@ async def read_line(stdout, hard_deadline, loop):
 
 
 def _overlong_evt():
-    return ("error", {"type": "overlong_line",
-                      "message": f"CLI emitted a line larger than STREAM_LIMIT "
-                                 f"({settings.stream_limit} bytes)"})
+    return wire.Failed(error_type="overlong_line",
+                       message=f"CLI emitted a line larger than STREAM_LIMIT "
+                               f"({settings.stream_limit} bytes)")
 
 
 def _timeout_evt(silent=True):
     msg = (f"CLI sent nothing for {settings.idle_timeout:.0f}s" if silent
            else f"CLI turn exceeded {settings.request_timeout:.0f}s")
-    return ("error", {"type": "timeout", "message": msg})
+    # retryable: eine Stille ist ein Zustand, kein Urteil über den Request.
+    return wire.Failed(error_type="timeout", message=msg, retryable=True)
+
+
+#: Ereignisse, nach denen der Turn vorbei ist.
+TERMINAL = (wire.ToolCall, wire.Done, wire.Failed)
 
 
 async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_prompt=None,
@@ -275,6 +329,7 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_pro
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + settings.request_timeout
+    yield wire.Started(model=model, reused=False)
     try:
         while True:
             try:
@@ -295,11 +350,10 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_pro
                 m = json.loads(raw)
             except Exception:
                 continue
-            ev = classify(m, stats, mark)
-            if ev is None:
-                continue
-            yield ev
-            if ev[0] in ("tool_use", "result", "error"):
+            events = classify(m, stats, mark, model)
+            for event in events:
+                yield event
+            if any(isinstance(e, TERMINAL) for e in events):
                 return
 
         # EOF ohne terminales Event -> CLI ist abgestürzt.
@@ -307,8 +361,9 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_pro
         stats["outcome"] = "error"
         stats["stderr_tail"] = tail
         log.error("CLI beendet ohne result. stderr:\n%s", tail or "(leer)")
-        yield ("error", {"type": "cli_exit",
-                         "message": (tail[-500:] if tail else "CLI exited without producing a result")})
+        yield wire.Failed(error_type="cli_exit",
+                          message=(tail[-500:] if tail
+                                   else "CLI exited without producing a result"))
     finally:
         err_task.cancel()
         with contextlib.suppress(Exception):
@@ -319,9 +374,9 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_pro
             log.debug("CLI stderr tail:\n%s", "\n".join(stderr_tail))
 
 
-async def drive_turn(prompt, mcp_tools, model, stats, effort=None, system_prompt=None,
-                     append_system=None):
-    """Öffentliche Schnittstelle: Pool (Reuse) oder One-Shot je nach Config."""
+async def drive_turn_events(prompt, mcp_tools, model, stats, effort=None, system_prompt=None,
+                            append_system=None):
+    """Öffentliche Schnittstelle: der Wire-Strom. Pool (Reuse) oder One-Shot je nach Config."""
     if settings.pool_enabled:
         from .pool import pooled_drive_turn  # lazy: vermeidet Zirkularimport
         async for ev in pooled_drive_turn(prompt, mcp_tools, model, stats, effort,
@@ -331,3 +386,33 @@ async def drive_turn(prompt, mcp_tools, model, stats, effort=None, system_prompt
         async for ev in _oneshot_turn(prompt, mcp_tools, model, stats, effort,
                                       system_prompt, append_system):
             yield ev
+
+
+async def drive_turn(prompt, mcp_tools, model, stats, effort=None, system_prompt=None,
+                     append_system=None):
+    """ÜBERGANG: derselbe Turn als alte Tupel, für die OpenAI-Oberflächen in main.py.
+
+    Entfällt, sobald die beiden Endpunkte den Wire-Strom direkt konsumieren. Bis dahin
+    bleibt ihr Verhalten unverändert — inklusive der Bündelung mehrerer Tool-Calls einer
+    Zeile zu EINEM ('tool_use', blocks)-Tupel, was der alte Vertrag war.
+    """
+    pending = []
+    async for event in drive_turn_events(prompt, mcp_tools, model, stats, effort,
+                                         system_prompt, append_system):
+        if isinstance(event, wire.ToolCall):
+            pending.append(event._raw)
+            continue
+        if pending:
+            yield ("tool_use", pending)
+            pending = []
+        if isinstance(event, wire.TextDelta):
+            yield ("delta", event.text)
+        elif isinstance(event, wire.ThinkingProgress):
+            yield ("thinking", event.tokens)
+        elif isinstance(event, wire.Done):
+            yield ("result", event.text)
+        elif isinstance(event, wire.Failed):
+            yield ("error", {"type": event.error_type, "message": event.message,
+                             "status": event.upstream_status})
+    if pending:
+        yield ("tool_use", pending)
