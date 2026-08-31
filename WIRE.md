@@ -132,6 +132,7 @@ Mehr nicht, und das ist Absicht:
 {"models": [
   {"id": "opus-5", "name": "Opus 5", "backend_model": "claude-opus-5",
    "context_length": 1000000,
+   "input_modalities": ["text", "image"],
    "efforts": {"supported": ["low","medium","high","xhigh","max"], "default": "high"},
    "knowledge_cutoff": null, "aliases": ["opus"]}
 ]}
@@ -146,6 +147,11 @@ Modellauswahl abbilden muss. Ein Konsument dieser API braucht das Gegenteil: jed
 `backend_model` ist der Name, den die CLI kennt — und derselbe Schlüssel, unter dem
 `done.cost.by_model` abrechnet. Nur damit lässt sich eine Kostenzeile einem Eintrag dieser
 Liste zuordnen; ohne ihn bliebe der Haiku-Nebenaufruf ein namenloser Posten.
+
+`input_modalities` gehört zum Modell und kommt aus derselben handgepflegten Registry wie
+Kontextfenster und Effort-Stufen. Der Claude-CLI-Pfad bietet keinen dynamischen Modellkatalog,
+den der Wrapper unverändert durchreichen könnte; deshalb wird die Fähigkeit hier explizit
+geführt, statt vom Consumer aus dem Providernamen erraten zu werden.
 
 `efforts.default` ist der Env-Default, **abgesenkt auf das, was das Modell kennt** — dieselbe
 Absenkung, die ein Request erfährt. Ein Modell ohne Stufen (Haiku) hat `supported: []` und

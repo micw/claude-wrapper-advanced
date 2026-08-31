@@ -475,7 +475,7 @@ async def c_models(ctx):
     # Wir reichen nur volle Namen an die CLI (nie Aliase — die driften mit der CLI-Version).
     # Ein CLI-Update, das einen Namen fallen lässt, muss hier auffallen und nicht im Betrieb.
     res = {}
-    for cli_model, _name, _ctx, _levels in settings.models.values():
+    for cli_model, _name, _ctx, _levels, _cutoff, _modalities in settings.models.values():
         async with CLI(model=cli_model) as cli:
             ev, _ = await cli.turn("Reply with exactly: OK")
             res[cli_model] = bool(ev) and not ev.get("is_error")

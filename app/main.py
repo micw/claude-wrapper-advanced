@@ -169,12 +169,13 @@ async def get_metrics():
     return snap
 
 
-def _model_obj(mid, name, ctx, levels, now, pinned=None):
+def _model_obj(mid, name, ctx, levels, input_modalities, now, pinned=None):
     """Ein /v1/models-Eintrag. Die Zusatzfelder sind OpenRouter-Konvention; strikte
     OpenAI-Clients ignorieren sie, open-webui nutzt 'name' als Anzeigenamen."""
     params = ["tools", "tool_choice"]
     obj = {"id": mid, "object": "model", "created": now, "owned_by": "anthropic",
-           "name": name, "context_length": ctx}
+           "name": name, "context_length": ctx,
+           "input_modalities": list(input_modalities)}
     if pinned:                       # Variante: die Effort-Wahl IST die ID
         obj["reasoning"] = {"default_enabled": True, "default_effort": pinned}
     elif levels:
@@ -191,11 +192,11 @@ async def list_models(req: Request):
     _require_auth(req)
     now = int(time.time())
     data = []
-    for mid, (_cli, name, ctx, levels, _cutoff) in settings.models.items():
-        data.append(_model_obj(mid, name, ctx, levels, now))
+    for mid, (_cli, name, ctx, levels, _cutoff, modalities) in settings.models.items():
+        data.append(_model_obj(mid, name, ctx, levels, modalities, now))
     for alias, target in settings.aliases.items():
-        _cli, name, ctx, levels, _cutoff = settings.models[target]
-        data.append(_model_obj(alias, f"{name.split()[0]} (latest)", ctx, levels, now))
+        _cli, name, ctx, levels, _cutoff, modalities = settings.models[target]
+        data.append(_model_obj(alias, f"{name.split()[0]} (latest)", ctx, levels, modalities, now))
     for alias, eff in settings.effort_picks:
         target = settings.aliases.get(alias, alias)
         entry = settings.models.get(target)
@@ -203,9 +204,9 @@ async def list_models(req: Request):
             log.warning("EFFORT_PICKS: '%s:%s' übersprungen (Modell oder Stufe unbekannt)",
                         alias, eff)
             continue
-        _cli, name, ctx, _levels, _cutoff = entry
+        _cli, name, ctx, _levels, _cutoff, modalities = entry
         data.append(_model_obj(f"{alias}:{eff}", f"{name.split()[0]} · {eff} effort",
-                               ctx, (), now, pinned=eff))
+                               ctx, (), modalities, now, pinned=eff))
     return {"object": "list", "data": data}
 
 

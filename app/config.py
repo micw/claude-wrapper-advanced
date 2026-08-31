@@ -10,7 +10,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Die Version wird mit dem Git-Tag mitgeführt (ab 1.6.0; davor stand sie auf 1.3.2, während
 # die Tags schon bei 1.5.2 lagen — die Tags waren und bleiben die Wahrheit).
 SERVICE = "claude-wrapper-advanced"
-VERSION = "1.7.2"
+VERSION = "1.8.0"
 
 
 def _truthy(v) -> bool:
@@ -27,20 +27,20 @@ _EFF5 = EFFORT_ORDER
 _EFF4 = ("low", "medium", "high", "max")      # 'xhigh' gibt es erst ab Opus 4.7
 DEFAULT_EFFORT = "high"                       # CLI-Default auf allen Modellen außer Opus 4.7
 
-# Felder: (CLI-Modell, Anzeigename, Kontext, Effort-Stufen, knowledge-cutoff).
+# Felder: (CLI-Modell, Anzeigename, Kontext, Effort-Stufen, knowledge-cutoff, Inputmodalitäten).
 # Cutoff wird im Replace-Modus mitgegeben, weil der CLI-Default — der ihn sonst pro Modell
 # liefert — dann weg ist und das Modell seine eigene Grenze sonst ~1 Jahr zu früh rät.
 # Werte aus dem CLI-Default abgelesen (tests/assumptions.py::model.registry gleicht sie ab);
 # None = die CLI nennt für dieses Modell keinen Cutoff (z.B. Opus 5) -> wir nennen auch keinen.
 # Pflege bei Modell-Releases, dieselbe Kadenz wie die Modell-Liste selbst.
 MODELS = {
-    # externe ID     CLI-Modell             Anzeige       Kontext    Effort      Cutoff
-    "opus-5":     ("claude-opus-5",     "Opus 5",     1_000_000, _EFF5, None),
-    "opus-4-8":   ("claude-opus-4-8",   "Opus 4.8",   1_000_000, _EFF5, "January 2026"),
-    "sonnet-5":   ("claude-sonnet-5",   "Sonnet 5",   1_000_000, _EFF5, "January 2026"),
-    "fable-5":    ("claude-fable-5",    "Fable 5",    1_000_000, _EFF5, "January 2026"),
-    "sonnet-4-6": ("claude-sonnet-4-6", "Sonnet 4.6", 1_000_000, _EFF4, "August 2025"),
-    "haiku-4-5":  ("claude-haiku-4-5",  "Haiku 4.5",    200_000, (),    "February 2025"),
+    # externe ID     CLI-Modell             Anzeige       Kontext    Effort  Cutoff           Input
+    "opus-5":     ("claude-opus-5",     "Opus 5",     1_000_000, _EFF5, None,              ("text", "image")),
+    "opus-4-8":   ("claude-opus-4-8",   "Opus 4.8",   1_000_000, _EFF5, "January 2026",    ("text", "image")),
+    "sonnet-5":   ("claude-sonnet-5",   "Sonnet 5",   1_000_000, _EFF5, "January 2026",    ("text", "image")),
+    "fable-5":    ("claude-fable-5",    "Fable 5",    1_000_000, _EFF5, "January 2026",    ("text", "image")),
+    "sonnet-4-6": ("claude-sonnet-4-6", "Sonnet 4.6", 1_000_000, _EFF4, "August 2025",     ("text", "image")),
+    "haiku-4-5":  ("claude-haiku-4-5",  "Haiku 4.5",    200_000, (),    "February 2025",   ("text", "image")),
 }
 
 ALIASES = {"opus": "opus-5", "sonnet": "sonnet-5",

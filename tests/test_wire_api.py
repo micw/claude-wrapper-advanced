@@ -61,6 +61,13 @@ class Models(unittest.TestCase):
         for m in self.models:
             self.assertEqual(m["backend_model"], settings.models[m["id"]][0])
 
+    def test_input_modalities_are_model_facts(self):
+        """Vision ist keine globale Servicebehauptung: jeder Registry-Eintrag nennt selbst,
+        was er annimmt, damit Consumer die Fähigkeit nicht aus dem Providernamen erraten."""
+        for m in self.models:
+            self.assertEqual(m["input_modalities"], list(settings.models[m["id"]][5]))
+            self.assertIn("text", m["input_modalities"])
+
     def test_a_model_without_effort_levels_has_no_default(self):
         """Haiku kennt keine Stufen — dann ist der Default None und nicht 'high'."""
         haiku = next(m for m in self.models if m["id"] == "haiku-4-5")

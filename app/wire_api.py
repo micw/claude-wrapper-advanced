@@ -72,7 +72,7 @@ async def models(req: Request):
         aliases.setdefault(target, []).append(alias)
 
     out = []
-    for mid, (cli_model, name, ctx, levels, cutoff) in settings.models.items():
+    for mid, (cli_model, name, ctx, levels, cutoff, input_modalities) in settings.models.items():
         # Der Env-Default gilt nur, soweit das Modell ihn kennt — dieselbe Absenkung, die
         # ein Request erfährt. Ohne Stufen (Haiku) gibt es keinen Default, nicht "high".
         default = clamp_effort(settings.effort or DEFAULT_EFFORT, levels) if levels else None
@@ -81,6 +81,7 @@ async def models(req: Request):
             "name": name,
             "backend_model": cli_model,
             "context_length": ctx,
+            "input_modalities": list(input_modalities),
             "efforts": {"supported": list(levels), "default": default},
             "knowledge_cutoff": cutoff,
             "aliases": aliases.get(mid, []),
