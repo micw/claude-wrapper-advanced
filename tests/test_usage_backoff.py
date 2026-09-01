@@ -1,121 +1,124 @@
-"""Verhalten der Usage-Abfrage, wenn die Gegenstelle nicht mitspielt.
-
-Aus dem Betrieb: die Usage-API antwortete im Container mit **429**, während dasselbe Konto
-von anderer Stelle 200 bekam. Ohne Sperre löst dann jeder Consumer-Request einen neuen
-Versuch aus — der Wrapper hält das Limit selbst am Leben.
-"""
+"""Age-controlled quota probes and explicit force modes (all offline)."""
+import asyncio
+import time
 import unittest
 from unittest import mock
 
 from app import limits
+from app.config import settings
 
 
-def _reset():
-    limits._cache.update({"at": 0.0, "val": None, "retry_at": None, "last_error": None})
+GLOBAL = {
+    "anthropic-ratelimit-unified-5h-utilization": "0.09",
+    "anthropic-ratelimit-unified-5h-reset": "1788278400",
+    "anthropic-ratelimit-unified-7d-utilization": "0.19",
+    "anthropic-ratelimit-unified-7d-reset": "1788631200",
+}
+FABLE = {**GLOBAL,
+    "anthropic-ratelimit-unified-7d_oi-utilization": "0.04",
+    "anthropic-ratelimit-unified-7d_oi-reset": "1788631200",
+}
 
 
-USAGE = {"limits": [{"kind": "session", "group": "session", "percent": 12,
-                     "resets_at": "2026-08-28T09:29:59.951654+00:00", "scope": None,
-                     "is_active": True}],
-         "extra_usage": {}, "spend": {}}
+def fresh_both(now=None):
+    now = int(time.time()) if now is None else now
+    limits.observe_turn_headers(FABLE, "claude-fable-5", now=now)
 
 
-class Backoff(unittest.IsolatedAsyncioTestCase):
+class ProbePolicy(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        _reset()
-        self.addCleanup(_reset)
+        limits._reset_observations()
+        limits._probe_inflight.update({"global": None, "fable-5": None})
+        self.old_global = settings.usage_global_max_age
+        self.old_fable = settings.usage_fable_max_age
+        settings.usage_global_max_age = 900
+        settings.usage_fable_max_age = 7200
 
-    async def test_success_is_cached(self):
-        with mock.patch.object(limits, "_fetch_sync", return_value=USAGE) as fetch:
+    def tearDown(self):
+        settings.usage_global_max_age = self.old_global
+        settings.usage_fable_max_age = self.old_fable
+        limits._reset_observations()
+
+    async def test_fresh_observations_need_no_probe(self):
+        fresh_both()
+        with mock.patch.object(limits, "_run_probe") as probe:
+            result = await limits.usage()
+        probe.assert_not_called()
+        self.assertLessEqual(result["groups"][0]["age_seconds"], 1)
+
+    async def test_normal_refresh_uses_fable_when_both_are_missing(self):
+        async def probe(kind):
+            self.assertEqual(kind, "fable-5")
+            fresh_both()
+        with mock.patch.object(limits, "_run_probe", side_effect=probe) as run:
             await limits.usage()
+        run.assert_awaited_once_with("fable-5")
+
+    async def test_only_global_stale_uses_haiku(self):
+        now = int(time.time())
+        fresh_both(now)
+        limits._observed["global"]["observed_at"] = now - 901
+        async def probe(kind):
+            self.assertEqual(kind, "global")
+            limits.observe_turn_headers(GLOBAL, "claude-haiku-4-5", now=now)
+        with mock.patch.object(limits, "_run_probe", side_effect=probe) as run:
             await limits.usage()
-        self.assertEqual(fetch.call_count, 1, "der zweite Abruf kommt aus dem Cache")
+        run.assert_awaited_once_with("global")
 
-    async def test_failure_blocks_further_attempts(self):
-        """Der Kern: ein 429 darf nicht bei jedem Request erneut angefragt werden."""
-        err = limits.UsageUnavailable("upstream 429")
-        with mock.patch.object(limits, "_fetch_sync", side_effect=err) as fetch:
-            for _ in range(5):
-                with self.assertRaises(limits.UsageUnavailable):
-                    await limits.usage()
-        self.assertEqual(fetch.call_count, 1, "nach dem Fehlschlag wird gesperrt")
+    async def test_fable_stale_probe_also_covers_global(self):
+        now = int(time.time())
+        fresh_both(now)
+        limits._observed["model:fable-5"]["observed_at"] = now - 7201
+        with mock.patch.object(limits, "_run_probe") as run:
+            await limits.usage()
+        run.assert_awaited_once_with("fable-5")
 
-    async def test_there_is_no_way_to_bypass_the_block(self):
-        """Es gab einmal ein `force`, das den Cache umging — aber nicht die Sperre.
+    async def test_force_modes_ignore_age(self):
+        for force, expected in (("global", "global"), ("fable-5", "fable-5"),
+                                ("all", "fable-5")):
+            with self.subTest(force=force):
+                fresh_both()
+                with mock.patch.object(limits, "_run_probe") as run:
+                    await limits.usage(force)
+                run.assert_awaited_once_with(expected)
 
-        Damit versprach es etwas, das es im wichtigsten Fall nicht halten konnte, und
-        außerhalb einer Sperre erhöhte es die Chance auf genau die Drosselung. Der
-        Parameter ist weg; dieser Test hält fest, dass keiner nachwächst.
-        """
-        import inspect
-        self.assertEqual(list(inspect.signature(limits.usage).parameters), [],
-                         "usage() nimmt keine Argumente — kein Umgehungsweg zum Hammer")
+    async def test_invalid_force_is_rejected(self):
+        with self.assertRaises(ValueError):
+            await limits.usage("true")
 
-    async def test_the_block_reports_the_remaining_time(self):
-        """Die Restzeit muss mit, sonst rät der Konsument.
+    async def test_known_snapshot_survives_probe_failure_with_real_age(self):
+        fresh_both(int(time.time()) - 10000)
+        with mock.patch.object(limits, "_run_probe",
+                               side_effect=limits.UsageUnavailable("no headers")):
+            result = await limits.usage()
+        self.assertGreaterEqual(result["groups"][0]["age_seconds"], 10000)
 
-        Beobachtet ohne sie: fünf Abrufe in drei Sekunden, was die Drosselung nur
-        verlängert. Und es ist die **Rest**zeit, nicht der Ausgangswert — nach der
-        halben Sperre ist die Hälfte übrig.
-        """
-        err = limits.UsageUnavailable("upstream 429", retry_after=120)
-        with mock.patch.object(limits, "_fetch_sync", side_effect=err):
+    async def test_cold_start_failure_is_an_error(self):
+        with mock.patch.object(limits, "_run_probe",
+                               side_effect=limits.UsageUnavailable("no headers")):
             with self.assertRaises(limits.UsageUnavailable):
                 await limits.usage()
-            # Zweiter Abruf: aus der Sperre, mit Restzeit statt ohne.
-            with self.assertRaises(limits.UsageUnavailable) as caught:
-                await limits.usage()
-        self.assertIsNotNone(caught.exception.retry_after)
-        self.assertGreater(caught.exception.retry_after, 118)
-        self.assertLessEqual(caught.exception.retry_after, 120)
 
-    async def test_the_remaining_time_never_goes_negative(self):
-        """Eine abgelaufene Sperre darf keine negative Wartezeit melden."""
-        limits._cache["retry_at"] = __import__("time").monotonic() - 5
-        self.assertEqual(limits._remaining(__import__("time").monotonic()), 0.0)
+    async def test_singleflight_joins_concurrent_force_calls(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
 
-    async def test_retry_after_is_honoured(self):
-        err = limits.UsageUnavailable("upstream 429", retry_after=42)
-        with mock.patch.object(limits, "_fetch_sync", side_effect=err):
-            with self.assertRaises(limits.UsageUnavailable):
-                await limits.usage()
-        remaining = limits._cache["retry_at"] - __import__("time").monotonic()
-        self.assertGreater(remaining, 40)
-        self.assertLess(remaining, 43)
+        async def probe(kind):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            limits.observe_turn_headers(GLOBAL, "claude-haiku-4-5")
 
-    async def test_absurd_retry_after_is_capped(self):
-        """Ein Wert von Stunden darf den Endpunkt nicht stilllegen."""
-        import urllib.error
-        http_err = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "99999"}, None)
-        with mock.patch.object(limits.urllib.request, "urlopen", side_effect=http_err), \
-                mock.patch.object(limits, "_token", return_value=("x", "test")):
-            with self.assertRaises(limits.UsageUnavailable) as cm:
-                limits._fetch_sync()
-        self.assertEqual(cm.exception.retry_after, limits.MAX_BACKOFF)
-
-    async def test_a_known_state_survives_a_failure(self):
-        """Ein alter Füllstand ist brauchbar — die Auflösung ist ohnehin ein Prozentpunkt."""
-        with mock.patch.object(limits, "_fetch_sync", return_value=USAGE):
-            first = await limits.usage()
-        self.assertNotIn("stale", first)
-
-        limits._cache["at"] = 0.0                      # Cache als abgelaufen markieren
-        err = limits.UsageUnavailable("upstream 429")
-        with mock.patch.object(limits, "_fetch_sync", side_effect=err):
-            stale = await limits.usage()
-        self.assertTrue(stale["stale"])
-        self.assertEqual(stale["stale_reason"], "upstream 429")
-        self.assertEqual(stale["windows"], first["windows"], "die Zahlen bleiben unverändert")
-
-    async def test_recovery_clears_the_block(self):
-        err = limits.UsageUnavailable("upstream 429", retry_after=0)
-        with mock.patch.object(limits, "_fetch_sync", side_effect=err):
-            with self.assertRaises(limits.UsageUnavailable):
-                await limits.usage()
-        with mock.patch.object(limits, "_fetch_sync", return_value=USAGE):
-            value = await limits.usage()
-        self.assertNotIn("stale", value)
-        self.assertIsNone(limits._cache["retry_at"])
+        with mock.patch.object(limits, "_probe", side_effect=probe):
+            first = asyncio.create_task(limits.usage("global"))
+            await entered.wait()
+            second = asyncio.create_task(limits.usage("global"))
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(first, second)
+        self.assertEqual(calls, 1)
 
 
 if __name__ == "__main__":

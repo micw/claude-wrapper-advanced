@@ -240,17 +240,32 @@ def classify(m, stats, mark_ttft, model=None):
     return []
 
 
-async def spawn_cli(args):
+async def spawn_cli(args, model=None, stdin=asyncio.subprocess.PIPE):
     """Startet die CLI. EINZIGE Spawn-Stelle — One-Shot und Pool teilen sie sich."""
-    return await asyncio.create_subprocess_exec(
-        settings.claude_bin, *args,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=settings.workdir,
-        env=child_env(),
-        limit=settings.stream_limit,   # NICHT weglassen: siehe settings.stream_limit
-    )
+    from .turn_headers import Capture
+    capture = Capture()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            settings.claude_bin, *args,
+            stdin=stdin,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=settings.workdir,
+            env=capture.configure(child_env()),
+            pass_fds=capture.pass_fds,
+            limit=settings.stream_limit,   # NICHT weglassen: siehe settings.stream_limit
+        )
+    except BaseException:
+        capture.abort_spawn()
+        raise
+    try:
+        await capture.parent_started()
+        proc.turn_header_capture = capture
+    except Exception as err:  # Header-Telemetrie darf Inferenz nie verhindern.
+        log.warning("turn-header capture konnte nicht starten: %s", err)
+        capture.abort_spawn()
+        proc.turn_header_capture = None
+    return proc
 
 
 class Silent(asyncio.TimeoutError):
@@ -308,7 +323,7 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_pro
                         append_system=None):
     """Eine frische CLI pro Request (kein Reuse)."""
     t0 = time.perf_counter()
-    proc = await spawn_cli(_build_args(mcp_tools, model, effort, system_prompt, append_system))
+    proc = await spawn_cli(_build_args(mcp_tools, model, effort, system_prompt, append_system), model)
     stats["spawn_ms"] = (time.perf_counter() - t0) * 1000
     stats["reused"] = False
 
@@ -358,6 +373,10 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_pro
                 m = json.loads(raw)
             except Exception:
                 continue
+            from .turn_headers import quota_event
+            quota = await quota_event(proc)
+            if quota is not None:
+                yield quota
             events = classify(m, stats, mark, model)
             for event in events:
                 yield event
@@ -378,6 +397,10 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_pro
             proc.kill()
         with contextlib.suppress(Exception):
             await proc.wait()
+        capture = getattr(proc, "turn_header_capture", None)
+        if capture is not None:
+            with contextlib.suppress(Exception):
+                await capture.close()
         if settings.log_cli_stderr and stderr_tail:
             log.debug("CLI stderr tail:\n%s", "\n".join(stderr_tail))
 

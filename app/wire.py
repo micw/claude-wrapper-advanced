@@ -102,6 +102,17 @@ class LimitStatus(Event):
 
 
 @dataclass
+class Quota(Event):
+    """Vollständiger letzter Kontingent-Snapshot nach einer Header-Beobachtung.
+
+    Getrennt von `Done.usage`: dort stehen Tokenzahlen dieses Turns, hier die
+    Abo-Fenster. Der Consumer ersetzt seinen Snapshot vollständig statt Deltas zu mergen.
+    """
+    type = "quota"
+    usage: dict = field(default_factory=dict)
+
+
+@dataclass
 class Done(Event):
     """Sauberes Turn-Ende. **Alle Abschlussdaten stehen hier**, nicht in einem Seitenkanal —
     das ist der eigentliche Grund für dieses Format: vorher musste jeder Konsument wissen,

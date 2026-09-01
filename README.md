@@ -50,10 +50,11 @@ genuine drop-in OpenAI backend:
 - **Real usage & cost** — OpenAI `usage` plus an OpenRouter-style `cost`, with cache read/write token stats.
 - **Observability** — `/metrics` exposes latency bands (ttft / spawn / overhead), cache hit-rate and
   every quota window the account has, each keeping its own last reading.
-- **Quota as a first-class surface** — `GET /wire/v1/usage` reports each window with its fill level
-  and, for a model-scoped one, which model it belongs to. A turn raises `limit_status` only when a
-  limit actually warns or bites; it carries no fill level, because the backend sends none
-  ([MESSUNGEN.md](MESSUNGEN.md) §4).
+- **Quota as a first-class surface** — a fail-open Bun preload captures the official CLI turn's
+  rate-limit response headers without proxying TLS. `GET /wire/v1/usage` reports global and
+  Fable-scoped windows with independent ages; stale data triggers tiny Haiku/Fable CLI probes.
+  `?force=global|fable-5|all` bypasses age caching, and fresh snapshots also arrive as `quota`
+  events in the native turn stream.
 - **Subscription-native & ToS-clean** — uses the official CLI login, never extracts tokens or touches the
   raw API. Ships as a non-root container with in-container login.
 
@@ -182,7 +183,7 @@ Until authenticated, `/v1/*` requests return **503** with a clear message, and `
 reports `"authenticated": false`. The published port is `127.0.0.1:${PROXY_PORT:-8000}` (localhost
 only).
 
-**The bundled CLI is pinned (`CLAUDE_VERSION=2.1.220`) on purpose** — only versions the assumption
+**The bundled CLI is pinned (`CLAUDE_VERSION=2.1.252`) on purpose** — only versions the assumption
 tests have passed on get shipped. To move the pin up, vet the new version first, then bump it in the
 Dockerfile:
 

@@ -151,6 +151,12 @@ Beobachtungen, die für das Format zählen:
 - **`severity`** haben wir nur als `"normal"` gesehen, und die CLI parst das Feld nicht
   einmal. Als „erreicht"-Signal ist `status: "rejected"` aus dem Turn belastbarer.
 
+Ein mit `claude setup-token` erzeugter Token (`sk-ant-oat01-…`) reicht für Inferenz, aber
+nicht für diesen Endpunkt. Direkt gemessen antwortet er reproduzierbar mit **403**,
+`oauth_scope_insufficient`, benötigter Scope `user:profile`. Ein neuer Setup-Token ändert
+daran nichts. Ein Browser-Login kann den Scope liefern, ist für einen unbeaufsichtigten
+Dienst wegen regelmäßig nötiger Re-Logins aber kein dauerhaftes Credential.
+
 ### 4.3 Einheiten und Fensterlängen
 
 | | Header | Usage-API |
@@ -269,7 +275,7 @@ Modells aus der Turn-Meldung nicht unterscheiden — dann `null` und Nachladen, 
 
 ---
 
-## 7. Die verworfene Option: Turn-Updates über einen Capture-Proxy
+## 7. Capture-Proxy und minimale CLI-Probe
 
 ### 7.1 Was er liefern würde
 
@@ -283,7 +289,7 @@ Zusammen mit der Regel aus §6 wäre daraus eine zur API kompatible Gruppen-Zuor
 ableitbar: das Header-Set nennt die geltenden Fenster, das Modell des Turns benennt den
 Scope, die Ids sind dieselben wie in `rateLimitType`.
 
-### 7.2 Warum wir es trotzdem nicht tun
+### 7.2 Warum ein Proxy vor allen normalen Turns zunächst verworfen wurde
 
 **Der gemessene Gegenwert ist fast null.** Die Auflösung beträgt einen Prozentpunkt (§1),
 im Leerlauf bewegt sich nichts (§1), und ein einzelner Turn liegt weit darunter. Ein
@@ -329,13 +335,82 @@ diese Rolle war er richtig. Sollte je eine konkrete Frage ihn wieder brauchen, w
 einzig verantwortbare Zuschnitt ein **Kanarien-Bucket**: eine Pool-Gruppe über den Proxy,
 der Rest direkt, damit ein Ausfall einen Bucket kostet und nicht den Dienst.
 
+### 7.3 Neubewertung: separater Minimal-Probe über die echte CLI
+
+Der Ausfall von `/api/oauth/usage` mit einem Setup-Token ändert die Abwägung: Statt alle
+produktiven Turns durch einen Proxy zu führen, liest ein fail-open **Bun-Preload** die
+Response-Header direkt am `fetch` der offiziellen CLI. Normale Turns aktualisieren den
+Stand damit ohne Zusatzkosten; eine separate, alterslimitierte CLI führt nur bei alten
+Daten einen minimalen echten Probe aus. Die offizielle CLI baut und authentifiziert den
+Request, der Wrapper bildet keinen Claude-Code-Request nach.
+
+Reproduzierbare kleinste Konfiguration mit CLI 2.1.198:
+
+```sh
+CLAUDE_CODE_OAUTH_TOKEN="$token" claude \
+  -p 'Reply only: OK' \
+  --model haiku \
+  --system-prompt '' \
+  --safe-mode \
+  --tools '' \
+  --output-format json \
+  </dev/null
+```
+
+Die entscheidende Option ist **`--tools ''`**. Eine manuell gepflegte
+`--disallowed-tools`-Liste erfasste nicht alle Builtins und ließ rund 11 000 Tokens
+System-/Tool-Kontext stehen. `--tools ''` ist die dokumentierte Komplettabschaltung und
+reduzierte denselben Haiku-Probe auf rund 155 normale Input-Tokens. Der verbleibende Block
+ist zu klein bzw. nicht markiert für Prompt-Caching: `cache_read_input_tokens` und
+`cache_creation_input_tokens` blieben auch über 100 identische Aufrufe beide null. Das ist
+für seltene Probes erwünscht — es gibt keinen teuren Kaltstart nach Ablauf eines 5-Minuten-
+Caches.
+
+Gemessene Last der finalen Form (`Reply only: OK`, warm/kalt identisch):
+
+| Modell | Aufrufe | Input gesamt | Output gesamt | Cache read/create | nominal pro Aufruf |
+|---|---:|---:|---:|---:|---:|
+| Haiku | 100 | 15 500 (155/Turn) | 7 913 (Ø 79/Turn) | 0 / 0 | $0.001112 |
+| Fable | 100 | 16 500 (165/Turn) | 400 (4/Turn) | 0 / 0 | $0.002429 |
+
+Die Header sind modellabhängig (§5.1): ein Haiku-Probe liefert `5h` und `7d`; für
+`7d_oi` braucht es einen Fable-Probe. Der normale CLI-Output reicht **nicht** zum Ablesen:
+`rate_limit_event` enthält bei `allowed` keinen Füllstand (§4.1). Der Capture muss daher die
+`anthropic-ratelimit-unified-*`-**Response-Header** des echten CLI-Requests lesen.
+
+Bei der Verbrauchsmessung bewegten 100 minimale Fable-Probes den sichtbaren 5h-Stand um
+rund zwei Prozentpunkte. Bei Haiku lag die beobachtete Größenordnung bei ein bis drei
+Punkten pro 100 Probes, war aber durch nachlaufende Verbuchung vorheriger Messphasen nicht
+sauber isoliert. Diese Zahlen sind Kalibrierung, keine Abrechnung: die Header runden auf
+einen Prozentpunkt und die Kontingentverbuchung lief sichtbar **zeitverzögert** nach. Ein
+Probe darf deshalb nicht aus einem unmittelbar folgenden Read auf seinen Einzelverbrauch
+schließen.
+
+Für eine Umsetzung folgen daraus diese Randbedingungen:
+
+1. Probe-Ergebnisse cachen und Probes hart rate-limiten; niemals pro Consumer-Request
+   einen Turn auslösen.
+2. Haiku für die kontoweiten Fenster verwenden; Fable nur deutlich seltener bzw. wenn der
+   skopierte Stand tatsächlich gebraucht wird.
+3. Jeder normale Nutzer-Turn aktualisiert über den Preload kostenlos die Header-Fenster,
+   die für seine Requests gelten, und verschiebt damit den nächsten Probe.
+4. Capture-Ausfall darf nur die Kennzahl altern lassen. Der normale Turn-Pool und die
+   Probes bleiben auf direktem Upstream; kein Proxy liegt im credential-tragenden Pfad.
+5. Header und Token niemals vollständig loggen. Für die Projektion reichen die bekannten
+   `anthropic-ratelimit-unified-*`-Felder.
+
+Geprüfte Sackgassen: `--bare` deaktiviert OAuth und endet mit `Not logged in`;
+`--max-budget-usd 0` verhindert den Request vollständig; `count_tokens` akzeptiert den
+Setup-Token, liefert aber keine Unified-Rate-Limit-Header; `--strict-mcp-config` hatte ohne
+konfigurierte MCP-Server keinen messbaren Effekt.
+
 ---
 
 ## 8. Was daraus im Wrapper folgt
 
 | Aufgabe | Quelle |
 |---|---|
-| **Karte** — welche Fenster, welchem Modell, wie voll | `GET /wire/v1/usage` (Poll oder auf Zuruf) |
+| **Karte** — welche Fenster, welchem Modell, wie voll | Turn-Header-Cache; `GET /wire/v1/usage` probiert bei alten Daten |
 | **Alarm** — Limit greift jetzt | `limit_status`-Ereignis im Turn, nur wenn nicht `allowed` |
 | **Abrechnung** — Tokens und Kosten pro Modell | `result.modelUsage` |
 

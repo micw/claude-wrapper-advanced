@@ -4,11 +4,11 @@
 # as root, and that flag is required to run MCP tools headless.
 
 # ---- Stage 1: fetch the CLI binary via npm ----
-# PINNED ON PURPOSE: ship only versions that tests/assumptions.py has passed on. 2.1.220 is
-# green on all 26 checks. To move up: run the suite against the new version first
+# PINNED ON PURPOSE: ship only versions that tests/assumptions.py has passed on. 2.1.252 is
+# green on all 34 checks. To move up: run the suite against the new version first
 # (CLAUDE_BIN=... python tests/assumptions.py), then bump here.
 FROM node:22-bookworm-slim AS cli
-ARG CLAUDE_VERSION=2.1.220
+ARG CLAUDE_VERSION=2.1.252
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_VERSION}
 # The npm package ships a self-contained native ELF; extract just that (drops Node + npm + JS).
 RUN cp "$(readlink -f "$(command -v claude)")" /claude && /claude --version

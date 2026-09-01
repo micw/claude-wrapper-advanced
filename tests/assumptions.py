@@ -28,7 +28,9 @@ NONCE = f"{int(time.time())}-{os.getpid()}"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import settings                     # noqa: E402
+from app import limits                              # noqa: E402
 from app.cli_driver import _PARENT_SESSION_VARS, _build_args, child_env  # noqa: E402
+from app.turn_headers import Capture                 # noqa: E402
 from app.translate import messages_to_prompt, openai_tools_to_mcp  # noqa: E402
 
 CLAUDE = settings.claude_bin
@@ -39,7 +41,7 @@ REQUIRED_FLAGS = [
     "--no-session-persistence", "--tools", "--effort",
     "--system-prompt", "--append-system-prompt",
     "--strict-mcp-config", "--mcp-config", "--allowedTools",
-    "--dangerously-skip-permissions", "--model",
+    "--dangerously-skip-permissions", "--model", "--safe-mode",
 ]
 
 # ---------------------------------------------------------------- check registry
@@ -151,6 +153,23 @@ def big(sent, n=300):
     return "\n".join(f"[{sent}-{NONCE}] line {i}: deterministic filler value={i*7%50}." for i in range(n))
 
 
+async def minimal_usage_probe(model):
+    """The production probe shape, with its result retained for magnitude assertions."""
+    from app.cli_driver import spawn_cli
+    limits._reset_observations()
+    args = ["-p", "Reply only: OK", "--model", model, "--system-prompt", "",
+            "--safe-mode", "--tools", "", "--output-format", "json",
+            "--no-session-persistence"]
+    proc = await spawn_cli(args, model, stdin=asyncio.subprocess.DEVNULL)
+    out, err = await asyncio.wait_for(proc.communicate(), timeout=45)
+    capture = getattr(proc, "turn_header_capture", None)
+    if capture is not None:
+        await capture.close()
+    if proc.returncode != 0:
+        raise RuntimeError((err or b"")[-300:].decode(errors="replace"))
+    return json.loads(out), limits.quota_snapshot()
+
+
 # ================================================================ TIER 1: OFFLINE
 @check("cli.version", 1, "CLI binary present and reports a version")
 async def c_version(ctx):
@@ -216,6 +235,12 @@ async def c_sysprompt_stack(ctx):
             self.send_response(400)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
+            # Synthetic quota values: proves the compiled CLI used our preloaded fetch and
+            # that response headers crossed the dedicated fd. Still no backend/tokens.
+            self.send_header("anthropic-ratelimit-unified-5h-utilization", "0.12")
+            self.send_header("anthropic-ratelimit-unified-5h-reset", "1788278400")
+            self.send_header("anthropic-ratelimit-unified-7d-utilization", "0.34")
+            self.send_header("anthropic-ratelimit-unified-7d-reset", "1788631200")
             self.end_headers()
             self.wfile.write(body)
 
@@ -225,19 +250,29 @@ async def c_sysprompt_stack(ctx):
     srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    env = {**child_env(), "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
-           "ANTHROPIC_API_KEY": "sk-assumptions-dummy"}
+    limits._reset_observations()
+    capture = Capture()
+    env = capture.configure({**child_env(), "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
+                             "ANTHROPIC_API_KEY": "sk-assumptions-dummy"})
     args = [CLAUDE, "-p", "hi", "--no-session-persistence", "--output-format", "stream-json",
             "--verbose", "--tools", "", "--model", "sonnet",
             "--system-prompt", "MARKER_BASE_xyz",
             "--append-system-prompt", "MARKER_CLIENT_xyz"]
     proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL,
-                                                stderr=asyncio.subprocess.DEVNULL, env=env)
+                                                stderr=asyncio.subprocess.DEVNULL, env=env,
+                                                pass_fds=capture.pass_fds)
+    await capture.parent_started()
     with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(proc.wait(), timeout=30)
     with contextlib.suppress(Exception):
         proc.kill()
+    await capture.close()
     srv.shutdown()
+    quota = limits.quota_snapshot()
+    ctx["preload_capture"] = {
+        "ready": capture.ready,
+        "global": quota["groups"][0],
+    }
     if not captured:
         return SKIP("kein Request abgefangen (Base-URL nicht benutzt?)")
     blob = "\n".join(b.get("text", "") for b in (captured[0].get("system") or []))
@@ -245,6 +280,21 @@ async def c_sysprompt_stack(ctx):
     if base and client:
         return OK("beide Flags stapeln")
     return FAIL(f"Stacking verletzt: base={base} client={client} — _build_args prüfen")
+
+
+@check("capture.preload_headers", 1,
+       "Bun preload sees /v1/messages response headers in the compiled CLI (offline)")
+async def c_capture_preload(ctx):
+    observed = ctx.get("preload_capture") or {}
+    global_ = observed.get("global") or {}
+    windows = {w.get("id"): w for w in global_.get("windows") or []}
+    if not observed.get("ready"):
+        return FAIL("preload_ready missing — BUN_OPTIONS/preload changed")
+    if windows.get("five_hour", {}).get("used_percent") != 12:
+        return FAIL(f"synthetic 5h header missing: {windows}")
+    if windows.get("seven_day", {}).get("used_percent") != 34:
+        return FAIL(f"synthetic 7d header missing: {windows}")
+    return OK("preload + fetch hook + response-header fd work")
 
 
 # ================================================================ TIER 2: ONLINE
@@ -320,6 +370,45 @@ async def c_stream(ctx):
         await cli.events_until(stop, timeout=60)
         await cli.interrupt()
     return OK("text_delta events arrive") if got["d"] else FAIL("no partial text deltas -> SSE streaming would break")
+
+
+def probe_magnitude(result, quota, model, output_max, cost_min, cost_max):
+    usage = result.get("usage") or {}
+    inp = ((usage.get("input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0)
+           + (usage.get("cache_creation_input_tokens") or 0))
+    out = usage.get("output_tokens") or 0
+    cache = (usage.get("cache_read_input_tokens") or 0) \
+        + (usage.get("cache_creation_input_tokens") or 0)
+    cost = result.get("total_cost_usd")
+    groups = {g["id"]: g for g in quota["groups"]}
+    global_ok = groups["global"]["observed_at"] is not None
+    fable_ok = groups["model:fable-5"]["observed_at"] is not None
+    detail = f"input={inp} output={out} cache={cache} cost={cost} global={global_ok} fable={fable_ok}"
+    if not 50 <= inp <= 500:
+        return FAIL(f"probe input magnitude drifted: {detail}")
+    if not 1 <= out <= output_max:
+        return FAIL(f"probe output magnitude drifted: {detail}")
+    if cache != 0:
+        return FAIL(f"minimal probe unexpectedly cached: {detail}")
+    if not isinstance(cost, (int, float)) or not cost_min <= cost <= cost_max:
+        return FAIL(f"probe nominal cost magnitude drifted: {detail}")
+    if not global_ok or (model == "fable-5" and not fable_ok):
+        return FAIL(f"probe quota headers missing: {detail}")
+    return OK(detail)
+
+
+@check("usage.probe_haiku_magnitude", 2,
+       "Minimal Haiku quota probe stays small and yields global headers")
+async def c_probe_haiku(ctx):
+    result, quota = await minimal_usage_probe(settings.models["haiku-4-5"][0])
+    return probe_magnitude(result, quota, "haiku-4-5", 300, 0.0001, 0.01)
+
+
+@check("usage.probe_fable_magnitude", 2,
+       "Minimal Fable quota probe stays small and yields scoped headers")
+async def c_probe_fable(ctx):
+    result, quota = await minimal_usage_probe(settings.models["fable-5"][0])
+    return probe_magnitude(result, quota, "fable-5", 100, 0.0002, 0.02)
 
 
 @check("usage.result_shape", 2, "result usage has the expected fields (drift detector)")

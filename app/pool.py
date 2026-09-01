@@ -59,7 +59,7 @@ class Proc:
         self._cum_cost = 0.0   # total_cost_usd der CLI ist kumulativ pro Prozess
 
     async def start(self):
-        self.proc = await spawn_cli(self.args)
+        self.proc = await spawn_cli(self.args, self.model)
         self._err_task = asyncio.create_task(self._drain_err())
         # Warm-up: /clear löst die CLI-Init aus (token-frei) und macht die Instanz nutzbar.
         # clear_timeout, NICHT request_timeout: das ist eine Sofort-Operation (~0.8s inkl. Init) —
@@ -170,6 +170,10 @@ class Proc:
                     m = json.loads(raw)
                 except Exception:
                     continue
+                from .turn_headers import quota_event
+                quota = await quota_event(self.proc)
+                if quota is not None:
+                    yield quota
                 events = classify(m, stats, mark, self.model)
                 if not events:
                     continue
@@ -218,6 +222,10 @@ class Proc:
             self.proc.kill()
         with contextlib.suppress(Exception):
             await self.proc.wait()
+        capture = getattr(self.proc, "turn_header_capture", None)
+        if capture is not None:
+            with contextlib.suppress(Exception):
+                await capture.close()
 
 
 class Pool:

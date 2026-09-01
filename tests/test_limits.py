@@ -1,31 +1,8 @@
-"""Kontingent-Projektion: beide Quellen müssen auf DENSELBEN Fensterschlüssel kommen.
-
-Die Fixtures sind aufgezeichnete Antworten (MESSUNGEN.md §4), keine erfundenen Formen.
-"""
+"""Quota projection from recorded CLI stream events and response headers."""
 import unittest
 
 from app import limits
 
-
-# Gekürzte, aber echte Antwort von GET /api/oauth/usage (Konto max, 2026-08-28).
-USAGE = {
-    "five_hour": {"utilization": 34.0, "resets_at": "2026-08-28T09:29:59.951654+00:00"},
-    "seven_day": {"utilization": 73.0, "resets_at": "2026-08-29T17:59:59.951681+00:00"},
-    "seven_day_opus": None,
-    "seven_day_sonnet": None,
-    "nimbus_quill": {"utilization": 0.0, "resets_at": None},
-    "limits": [
-        {"kind": "session", "group": "session", "percent": 34, "severity": "normal",
-         "resets_at": "2026-08-28T09:29:59.951654+00:00", "scope": None, "is_active": False},
-        {"kind": "weekly_all", "group": "weekly", "percent": 73, "severity": "normal",
-         "resets_at": "2026-08-29T17:59:59.951681+00:00", "scope": None, "is_active": True},
-        {"kind": "weekly_scoped", "group": "weekly", "percent": 1, "severity": "normal",
-         "resets_at": "2026-08-29T17:59:59.951965+00:00", "is_active": False,
-         "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
-    ],
-    "extra_usage": {"is_enabled": False, "spend_limit_reached": False, "utilization": None},
-    "spend": {"can_purchase_credits": False},
-}
 
 # Aufgezeichnetes rate_limit_event. `overageStatus: rejected` ist auf diesem Konto der
 # Dauerzustand (Guthaben org-weit deaktiviert) und darf deshalb NICHTS auslösen.
@@ -33,32 +10,18 @@ EVENT_ALLOWED = {"status": "allowed", "resetsAt": 1787909400, "rateLimitType": "
                  "overageStatus": "rejected", "overageDisabledReason": "org_level_disabled",
                  "isUsingOverage": False}
 
+HEADERS = {
+    "anthropic-ratelimit-unified-5h-utilization": "0.08",
+    "anthropic-ratelimit-unified-5h-reset": "1788278400",
+    "anthropic-ratelimit-unified-7d-utilization": "0.19",
+    "anthropic-ratelimit-unified-7d-reset": "1788631200",
+    "anthropic-ratelimit-unified-7d_oi-utilization": "0.04",
+    "anthropic-ratelimit-unified-7d_oi-reset": "1788631200",
+    "anthropic-ratelimit-unified-status": "allowed",  # deliberately not projected
+}
+
 
 class WindowKeys(unittest.TestCase):
-    def test_usage_projection(self):
-        windows = limits.from_usage(USAGE)["windows"]
-        self.assertEqual(set(windows), {"global/five_hour", "global/seven_day",
-                                        "model:fable-5/seven_day"})
-        self.assertEqual(windows["global/seven_day"]["used_percent"], 73)
-        self.assertEqual(windows["global/five_hour"]["window_seconds"], 18000)
-        self.assertEqual(windows["model:fable-5/seven_day"]["scope"]["model"], "Fable")
-
-    def test_codename_slots_are_not_windows(self):
-        """nimbus_quill steht top-level, aber nicht in limits[] — gemessen ein anderes
-        Fenster als das skopierte (0.0 gegen 1). Es darf nicht als Fenster erscheinen."""
-        windows = limits.from_usage(USAGE)["windows"]
-        self.assertNotIn("global/nimbus_quill", windows)
-        self.assertTrue(all("nimbus" not in k for k in windows))
-
-    def test_turn_and_api_agree_on_the_key(self):
-        """Der Kern: der Claim eines Fable-Turns muss auf denselben Schlüssel führen wie
-        der weekly_scoped-Eintrag der API. In den Daten gibt es dafür keine Brücke —
-        sie entsteht erst aus Dauer + Modell des Turns (limits.py, Modul-Docstring)."""
-        from_api = set(limits.from_usage(USAGE)["windows"])
-        from_turn = limits.window_key("seven_day_overage_included", "claude-fable-5")
-        self.assertEqual(from_turn, "model:fable-5/seven_day")
-        self.assertIn(from_turn, from_api)
-
     def test_account_wide_keys_need_no_model(self):
         self.assertEqual(limits.window_key("five_hour", None), "global/five_hour")
         self.assertEqual(limits.window_key("seven_day", "claude-opus-4-8"), "global/seven_day")
@@ -73,6 +36,72 @@ class WindowKeys(unittest.TestCase):
 
     def test_unknown_model_is_passed_through(self):
         self.assertEqual(limits.model_key("Cinder Cove"), "cinder-cove")
+
+    def test_dated_internal_model_normalises(self):
+        self.assertEqual(limits.model_key("claude-haiku-4-5-20251001"), "haiku-4-5")
+
+
+class HeaderUsage(unittest.TestCase):
+    def setUp(self):
+        limits._reset_observations()
+
+    def tearDown(self):
+        limits._reset_observations()
+
+    def test_global_and_fable_have_stable_and_upstream_ids(self):
+        result = limits.observe_turn_headers(HEADERS, "claude-fable-5", now=1000)
+        groups = {g["id"]: g for g in result["groups"]}
+        self.assertEqual(groups["global"]["upstream_id"], None)
+        self.assertEqual(groups["model:fable-5"]["upstream_id"], "7d_oi")
+        self.assertEqual(groups["model:fable-5"]["scope"], {"models": ["fable-5"]})
+        windows = {w["id"]: w for w in groups["global"]["windows"]}
+        self.assertEqual(windows["five_hour"]["upstream_id"], "5h")
+        self.assertEqual(windows["five_hour"]["used_percent"], 8.0)
+        self.assertEqual(windows["seven_day"]["upstream_id"], "7d")
+
+    def test_non_fable_does_not_claim_special_window(self):
+        result = limits.observe_turn_headers(HEADERS, "claude-haiku-4-5", now=1000)
+        fable = next(g for g in result["groups"] if g["id"] == "model:fable-5")
+        self.assertIsNone(fable["observed_at"])
+        self.assertIsNone(fable["windows"][0]["used_percent"])
+
+    def test_age_is_per_group(self):
+        limits.observe_turn_headers(HEADERS, "claude-fable-5", now=1000)
+        limits.observe_turn_headers(HEADERS, "claude-haiku-4-5", now=1100)
+        groups = {g["id"]: g for g in limits.quota_snapshot(now=1120)["groups"]}
+        self.assertEqual(groups["global"]["age_seconds"], 20)
+        self.assertEqual(groups["model:fable-5"]["age_seconds"], 120)
+
+    def test_parallel_older_percentage_does_not_move_backwards(self):
+        limits.observe_turn_headers(HEADERS, "claude-haiku-4-5", now=1000)
+        lower = dict(HEADERS, **{"anthropic-ratelimit-unified-5h-utilization": "0.07"})
+        limits.observe_turn_headers(lower, "claude-haiku-4-5", now=1001)
+        global_ = limits.quota_snapshot(now=1001)["groups"][0]
+        five = next(w for w in global_["windows"] if w["id"] == "five_hour")
+        self.assertEqual(five["used_percent"], 8.0)
+
+    def test_new_reset_may_lower_percentage(self):
+        limits.observe_turn_headers(HEADERS, "claude-haiku-4-5", now=1000)
+        new = dict(HEADERS, **{
+            "anthropic-ratelimit-unified-5h-utilization": "0.01",
+            "anthropic-ratelimit-unified-5h-reset": "1788290000",
+        })
+        limits.observe_turn_headers(new, "claude-haiku-4-5", now=1001)
+        five = limits.quota_snapshot(now=1001)["groups"][0]["windows"][0]
+        self.assertEqual(five["used_percent"], 1.0)
+
+    def test_status_is_not_in_public_usage(self):
+        result = limits.observe_turn_headers(HEADERS, "claude-fable-5", now=1000)
+        blob = __import__("json").dumps(result)
+        self.assertNotIn("status", blob)
+        self.assertNotIn("reached", blob)
+
+    def test_malformed_pair_does_not_refresh_age(self):
+        self.assertIsNone(limits.observe_turn_headers({
+            "anthropic-ratelimit-unified-5h-utilization": "nope",
+            "anthropic-ratelimit-unified-5h-reset": "123",
+        }, "claude-haiku-4-5", now=1000))
+        self.assertIsNone(limits.quota_snapshot(now=1000)["groups"][0]["observed_at"])
 
 
 class TurnStatus(unittest.TestCase):

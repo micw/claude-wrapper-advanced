@@ -168,19 +168,21 @@ async def responses(req: Request):
 
 
 @router.get("/usage")
-async def get_usage(req: Request):
+async def get_usage(req: Request, force: str | None = None):
     """Kontingent des Kontos: welche Fenster es gibt, wem sie gehören, wie voll sie sind.
 
-    Ein Request an das Backend, gecacht (`USAGE_TTL`, Standard 60 s). Häufiger zu fragen
-    bringt nichts: die Auflösung des Füllstands ist ein Prozentpunkt, und im Minutentakt
-    bewegt sich nichts (MESSUNGEN.md §1).
-
-    Die einzige Quelle für Füllstände und für die Frage, welchem **Modell** ein Fenster
-    gehört: das Turn-Ereignis trägt beides nicht (MESSUNGEN.md §4.1).
+    Normale Turns aktualisieren den Cache kostenlos aus ihren Response-Headern. Zu alte
+    Gruppen werden per minimalem CLI-Probe erneuert. `force` darf `global`, `fable-5` oder
+    `all` sein und umgeht das jeweilige MAX_AGE.
     """
     require_api_key(req)
+    if force not in (None, "global", "fable-5", "all"):
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "force must be one of: global, fable-5, all",
+            "type": "invalid_request_error", "code": "invalid_value",
+            "param": "force", "valid_values": ["global", "fable-5", "all"]}})
     try:
-        return await limits.usage()
+        return await limits.usage(force)
     except limits.UsageUnavailable as err:
         # 503 und nicht 502: der Dienst arbeitet, nur diese Auskunft steht gerade nicht
         # zur Verfügung. Turns laufen davon unberührt weiter.

@@ -36,6 +36,7 @@ der Client die Verbindung ab, endet der Turn mit ihr.
 
 ```
 data: {"type":"started","model":"claude-sonnet-5","reused":false}
+data: {"type":"quota","usage":{"groups":[…]}}
 data: {"type":"text_delta","text":"O"}
 data: {"type":"done","stop_reason":"end_turn","text":"OK","usage":{…},"cost":{…},"timing":{…}}
 ```
@@ -49,6 +50,7 @@ data: {"type":"done","stop_reason":"end_turn","text":"OK","usage":{…},"cost":{
 | `thinking_progress` | `tokens` | **kein Text** — die CLI redigiert ihn (MESSUNGEN.md §3) |
 | `tool_call` | `id`, `name`, `arguments` | `id` ist die **Backend-Kennung** (`toolu_…`), `arguments` ein JSON-**String**, wie die CLI ihn liefert; höchstens einer pro Turn |
 | `limit_status` | `window`, `claim`, `status`, `resets_at`, `surpassed_threshold`, `overage`, `usage_stale` | nur im Alarmfall, s.u. |
+| `quota` | `usage` | vollständiger letzter Kontingent-Snapshot nach frischen Turn-Response-Headern |
 | `done` | `stop_reason`, `text`, `usage`, `cost`, `timing` | sauberes Ende — **auch nach einem Tool-Call**, s.u. |
 | `failed` | `error_type`, `message`, `upstream_status`, `retryable` | getrennt von `done`, weil Fehler und Ende zwei Fälle sind |
 
@@ -162,49 +164,43 @@ keinen nennt (Opus 5) — wir erfinden dann auch keinen.
 
 ## 5. `GET /wire/v1/usage`
 
-Der Kontingent-Stand des Kontos. **Die einzige Quelle für Füllstände** und für die Frage,
-welchem Modell ein Fenster gehört.
+Der letzte aus offiziellen CLI-Response-Headern beobachtete Kontingent-Stand. Gruppen
+tragen ihr eigenes Alter: ein Sonnet-Turn kann global gerade erneuert haben, während der
+Fable-Stand älter ist.
 
 ```json
 {
-  "windows": {
-    "global/five_hour":        {"used_percent": 34, "window_seconds": 18000,
-                                "resets_at": 1787909400, "resets_in_seconds": 5985,
-                                "reached": false, "scope": null, "is_active": false},
-    "global/seven_day":        {"used_percent": 73, "window_seconds": 604800, "…": "…"},
-    "model:fable-5/seven_day": {"used_percent": 1,
-                                "scope": {"model": "Fable", "surface": null}, "…": "…"}
-  },
-  "credits": {"enabled": false, "utilization": null, "…": "…"},
-  "fetched_at": 1787903000
+  "groups": [
+    {"id":"global", "upstream_id":null, "scope":null,
+     "observed_at":1787903000, "age_seconds":42,
+     "windows":[
+       {"id":"five_hour", "upstream_id":"5h", "used_percent":34,
+        "window_seconds":18000, "resets_at":1787909400},
+       {"id":"seven_day", "upstream_id":"7d", "used_percent":73,
+        "window_seconds":604800, "resets_at":1788412321}]},
+    {"id":"model:fable-5", "upstream_id":"7d_oi",
+     "scope":{"models":["fable-5"]}, "observed_at":1787899000,
+     "age_seconds":4042,
+     "windows":[{"id":"seven_day", "upstream_id":"7d_oi", "used_percent":1,
+                 "window_seconds":604800, "resets_at":1788412321}]}
+  ]
 }
 ```
 
-Ein Request an das Backend, gecacht (`USAGE_TTL`, Standard 60 s). **Keinen Parameter, der
-den Cache umgeht** — es gab einmal `?force=1`, aber es umging die Sperre nicht und
-versprach damit im wichtigsten Fall etwas, das es nicht halten konnte; außerhalb einer
-Sperre erhöhte es nur die Chance auf die Drosselung.
+Normale Turns aktualisieren passende Gruppen kostenlos. Ein normaler GET startet nur bei
+Überschreiten von `USAGE_GLOBAL_MAX_AGE` bzw. `USAGE_FABLE_MAX_AGE` einen minimalen
+Haiku-/Fable-CLI-Probe. Kein periodischer Timer läuft im Hintergrund.
 
-Ein Minutentakt verliert nichts: die Auflösung des Backends beträgt einen Prozentpunkt,
-und im Leerlauf bewegt sich der Zähler nicht (MESSUNGEN.md §1).
+`?force=global`, `?force=fable-5` und `?force=all` umgehen die Altersprüfung explizit.
+Ein Fable-Probe liefert zugleich `5h`, `7d` und `7d_oi`; `all` braucht deshalb heute nur
+diesen einen Probe. Gleichzeitige gleiche Probes werden per Singleflight zusammengefasst.
 
 ### Wenn die Quelle nicht antwortet
 
-Die Usage-API des Backends limitiert sich **selbst** — im Betrieb beobachtet: ein `429`,
-während dasselbe Konto von anderer Stelle `200` bekam, ohne dass ein Kontingent erschöpft
-war. Der Wrapper reagiert darauf so:
-
-- **Sperre nach einem Fehlschlag** (`Retry-After`, sonst `USAGE_FAILURE_BACKOFF`, Standard
-  60 s, gedeckelt auf 15 min). Ohne sie löste jeder Consumer-Request einen neuen Versuch
-  aus und der Wrapper hielte ein 429 selbst am Leben. Einen Umgehungsweg gibt es nicht.
-- **Der `503` nennt `Retry-After`** — als Header (RFC 9110) und als `error.retry_after` im
-  Body, wo eine Zeit bekannt ist. Es ist die **Rest**zeit der Sperre, nicht der
-  Ausgangswert der Gegenstelle. Ohne diese Angabe rät der Konsument: im Betrieb beobachtet
-  waren fünf Abrufe in drei Sekunden, was die Drosselung nur verlängert.
-- **Der letzte bekannte Stand wird weitergereicht**, markiert mit `stale: true` und
-  `stale_reason`. Ein alter Füllstand ist brauchbar, solange klar ist, dass er alt ist.
-- **`503` nur, wenn es überhaupt keinen Stand gibt** — also bis zum ersten erfolgreichen
-  Abruf nach dem Start.
+Schlägt ein altersgesteuerter Probe fehl, bleibt der letzte bekannte Stand erhalten; sein
+`age_seconds` macht die Alterung sichtbar. `503` gibt es nur beim Cold Start ohne jeden
+globalen Stand. Ein erzwungener Probe meldet seinen Fehler, statt einen erfolgreichen
+Reload vorzutäuschen.
 
 ---
 
@@ -246,8 +242,8 @@ eine fehlende Zahl als 0 liest.
 
 ```
 einmal beim Start        GET /wire/v1/usage        Karte: welche Fenster, wem, wie voll
-laufend                  alle ~60 s pollen         Füllstände aktuell halten
-nach 503                 Retry-After abwarten      frueher fragen bringt nichts
+laufend                  quota im Turn-Strom       Snapshot vollständig ersetzen
+Reload global            GET /usage?force=global  Alterscache bewusst umgehen
 ```
 
 Nachladen lohnt außerdem bei einem **unbekannten `window`**: dann kennt der Konsument ein
@@ -265,8 +261,8 @@ Backend ein neues Fenster provisioniert.
 - **Kein `active_group`.** Welches Fenster ein Turn belastet hat, sagt das Backend nicht.
   `limit_status.claim` ist die Wahl des Servers, welches Fenster er für repräsentativ hält
    — gemessen `five_hour` in 18 von 18 Turns, auch bei vollerem Wochenfenster.
-- **Keine Füllstände im Turn.** Siehe §7. Sie wären nur über einen Capture-Proxy im
-  Auth-Pfad zu haben; die Abwägung und die Entscheidung dagegen stehen in MESSUNGEN.md §7.
+- **Kein Status im `quota`-Snapshot.** Der Wrapper liefert Messwert, Reset und Alter;
+  Schwellwerte, Farben und Darstellung entscheidet der Konsument.
 - **Höchstens ein `tool_call` pro Turn** — die Decke der CLI, nicht des Formats.
 
 Auch ein Tool-Turn endet nach `tool_call` mit `done` (`stop_reason: "tool_use"`). Seine Usage

@@ -10,7 +10,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Die Version wird mit dem Git-Tag mitgeführt (ab 1.6.0; davor stand sie auf 1.3.2, während
 # die Tags schon bei 1.5.2 lagen — die Tags waren und bleiben die Wahrheit).
 SERVICE = "claude-wrapper-advanced"
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 
 def _truthy(v) -> bool:
@@ -160,6 +160,11 @@ class Settings:
         self.pool_max_uses = int(os.getenv("POOL_MAX_USES", "100"))       # danach recyceln
         self.pool_reap_interval = float(os.getenv("POOL_REAP_INTERVAL", "30"))
         self.clear_timeout = float(os.getenv("CLEAR_TIMEOUT", "15"))       # /clear ist instant; kurz halten
+        # Kein periodischer Timer: /usage probiert nur, wenn die letzte echte
+        # Header-Beobachtung älter ist. Normale Turns verjüngen sie kostenlos.
+        self.usage_global_max_age = float(os.getenv("USAGE_GLOBAL_MAX_AGE", "900"))
+        self.usage_fable_max_age = float(os.getenv("USAGE_FABLE_MAX_AGE", "7200"))
+        self.usage_probe_timeout = float(os.getenv("USAGE_PROBE_TIMEOUT", "30"))
         # Modell-Registry: endliche Liste, siehe MODELS/ALIASES unten.
         self.models = MODELS
         self.aliases = ALIASES

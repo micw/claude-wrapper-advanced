@@ -125,3 +125,22 @@ class UsageUnavailableResponse(unittest.TestCase):
         import json
         self.assertNotIn("retry_after", json.loads(resp.body)["error"])
 
+
+class UsageForce(unittest.TestCase):
+    def test_every_force_mode_is_forwarded(self):
+        from unittest import mock
+        for force in (None, "global", "fable-5", "all"):
+            with self.subTest(force=force), \
+                    mock.patch.object(wire_api.limits, "usage", return_value={}) as usage:
+                asyncio.run(wire_api.get_usage(FakeRequest(), force))
+                usage.assert_awaited_once_with(force)
+
+    def test_invalid_force_lists_valid_values(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(wire_api.get_usage(FakeRequest(), "true"))
+        self.assertEqual(caught.exception.status_code, 400)
+        error = caught.exception.detail["error"]
+        self.assertEqual(error["code"], "invalid_value")
+        self.assertEqual(error["valid_values"], ["global", "fable-5", "all"])
+
