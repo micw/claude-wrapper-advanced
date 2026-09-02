@@ -10,7 +10,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Die Version wird mit dem Git-Tag mitgeführt (ab 1.6.0; davor stand sie auf 1.3.2, während
 # die Tags schon bei 1.5.2 lagen — die Tags waren und bleiben die Wahrheit).
 SERVICE = "claude-wrapper-advanced"
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 
 def _truthy(v) -> bool:
@@ -35,6 +35,7 @@ DEFAULT_EFFORT = "high"                       # CLI-Default auf allen Modellen a
 # Pflege bei Modell-Releases, dieselbe Kadenz wie die Modell-Liste selbst.
 MODELS = {
     # externe ID     CLI-Modell             Anzeige       Kontext    Effort  Cutoff           Input
+    "fable-5-1":  ("claude-fable-5-1",  "Fable 5.1",  1_000_000, _EFF5, "June 2026",       ("text", "image")),
     "opus-5":     ("claude-opus-5",     "Opus 5",     1_000_000, _EFF5, None,              ("text", "image")),
     "opus-4-8":   ("claude-opus-4-8",   "Opus 4.8",   1_000_000, _EFF5, "January 2026",    ("text", "image")),
     "sonnet-5":   ("claude-sonnet-5",   "Sonnet 5",   1_000_000, _EFF5, "January 2026",    ("text", "image")),
@@ -44,9 +45,17 @@ MODELS = {
 }
 
 ALIASES = {"opus": "opus-5", "sonnet": "sonnet-5",
-           "haiku": "haiku-4-5", "fable": "fable-5"}
+           "haiku": "haiku-4-5", "fable": "fable-5-1"}
 # 'best' bewusst nicht: der CLI-Alias bedeutet "Fable, wo verfügbar, sonst neuestes Opus" —
-# eine statische Abbildung auf fable-5 verliert diese Bedeutung und dupliziert nur 'fable'.
+# eine statische Abbildung verliert diese Fallback-Semantik und dupliziert nur 'fable'.
+
+# Kontingent-Zugehörigkeit ist eine Modelleigenschaft. Gemessen senden Fable 5.0 UND 5.1
+# dasselbe `7d_oi`-Fenster (identischer Reset/Füllstand); die Probe nimmt den ersten, also
+# neuesten Registry-Eintrag der Gruppe. /wire/v1/models exponiert diese Relation ebenfalls.
+MODEL_LIMIT_GROUPS = {
+    "fable-5-1": ("fable",),
+    "fable-5": ("fable",),
+}
 
 # Leiter von Absichten statt Kreuzprodukt: jeder Eintrag beantwortet "warum der und
 # nicht der daneben". Kleines Modell auf hoher Stufe fehlt bewusst — dafür gibt es
@@ -168,6 +177,7 @@ class Settings:
         # Modell-Registry: endliche Liste, siehe MODELS/ALIASES unten.
         self.models = MODELS
         self.aliases = ALIASES
+        self.model_limit_groups = MODEL_LIMIT_GROUPS
         # Picker-Einträge mit festgenagelter Effort-Stufe ('opus:medium'). Leer = keine.
         # Kein ':high' — das ist der Default und wäre ein Duplikat der nackten ID.
         self.effort_picks = _parse_picks(os.getenv("EFFORT_PICKS", DEFAULT_EFFORT_PICKS))

@@ -104,6 +104,10 @@ def status_from_event(info, model=None):
 # ---------------------------------------------------- response-header snapshots
 
 _HEADER_PREFIX = "anthropic-ratelimit-unified-"
+_FABLE_MODELS = tuple(
+    model for model in settings.models
+    if "fable" in settings.model_limit_groups.get(model, ())
+)
 _GROUP_SPECS = {
     "global": {
         "upstream_id": None,
@@ -112,7 +116,7 @@ _GROUP_SPECS = {
     },
     "model:fable-5": {
         "upstream_id": "7d_oi",
-        "scope": {"models": ["fable-5"]},
+        "scope": {"family": "fable", "models": list(_FABLE_MODELS)},
         "windows": (("seven_day", "7d_oi", 604800),),
     },
 }
@@ -176,7 +180,7 @@ def observe_turn_headers(headers, model=None, now=None):
         state["revision"] += 1
         changed = True
 
-    if model_key(model) == "fable-5":
+    if model_key(model) in _FABLE_MODELS:
         value = _header_window(headers, "7d_oi")
         if value:
             state = _observed["model:fable-5"]
@@ -233,7 +237,7 @@ def _reset_observations():
 
 async def _probe(kind):
     """Run the smallest real CLI turn. A Fable response refreshes both groups."""
-    model_id = "haiku-4-5" if kind == "global" else "fable-5"
+    model_id = "haiku-4-5" if kind == "global" else _FABLE_MODELS[0]
     cli_model = settings.models[model_id][0]
     target = "global" if kind == "global" else "model:fable-5"
     before = _observed[target]["revision"]

@@ -4,7 +4,7 @@ services:
       context: .
       args:
         # Pinned to a version the assumption tests passed on (see Dockerfile).
-        CLAUDE_VERSION: ${CLAUDE_VERSION:-2.1.252}
+        CLAUDE_VERSION: ${CLAUDE_VERSION:-2.1.258}
     image: claude-wrapper-advanced
     # Published on localhost only by default. Override PROXY_PORT to change the host port.
     ports:

@@ -31,7 +31,8 @@ genuine drop-in OpenAI backend:
 - **Per-request effort control** — OpenAI `reasoning_effort`, OpenRouter `reasoning.effort`, or a
   model-name suffix like `opus:max` (the model picker doubles as an effort selector).
 - **Explicit model list** — a finite, hand-kept registry (`app/config.py`), exposed without the
-  `claude-` prefix: `opus-5`, `opus-4-8`, `sonnet-5`, `sonnet-4-6`, `fable-5`, `haiku-4-5`, plus the
+  `claude-` prefix: `fable-5-1`, `fable-5`, `opus-5`, `opus-4-8`, `sonnet-5`, `sonnet-4-6`,
+  `haiku-4-5`, plus the
   aliases `opus`/`sonnet`/`fable`/`haiku` resolved *by us* — CLI aliases drift with the CLI version.
   An unknown model is a **404 `model_not_found`**, an unsupported effort a **400 `invalid_value`**
   naming the valid levels; neither silently falls back to a default. Effort levels are validated
@@ -183,7 +184,7 @@ Until authenticated, `/v1/*` requests return **503** with a clear message, and `
 reports `"authenticated": false`. The published port is `127.0.0.1:${PROXY_PORT:-8000}` (localhost
 only).
 
-**The bundled CLI is pinned (`CLAUDE_VERSION=2.1.252`) on purpose** — only versions the assumption
+**The bundled CLI is pinned (`CLAUDE_VERSION=2.1.258`) on purpose** — only versions the assumption
 tests have passed on get shipped. To move the pin up, vet the new version first, then bump it in the
 Dockerfile:
 

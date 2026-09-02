@@ -392,7 +392,7 @@ def probe_magnitude(result, quota, model, output_max, cost_min, cost_max):
         return FAIL(f"minimal probe unexpectedly cached: {detail}")
     if not isinstance(cost, (int, float)) or not cost_min <= cost <= cost_max:
         return FAIL(f"probe nominal cost magnitude drifted: {detail}")
-    if not global_ok or (model == "fable-5" and not fable_ok):
+    if not global_ok or (model.startswith("fable-") and not fable_ok):
         return FAIL(f"probe quota headers missing: {detail}")
     return OK(detail)
 
@@ -407,8 +407,8 @@ async def c_probe_haiku(ctx):
 @check("usage.probe_fable_magnitude", 2,
        "Minimal Fable quota probe stays small and yields scoped headers")
 async def c_probe_fable(ctx):
-    result, quota = await minimal_usage_probe(settings.models["fable-5"][0])
-    return probe_magnitude(result, quota, "fable-5", 100, 0.0002, 0.02)
+    result, quota = await minimal_usage_probe(settings.models["fable-5-1"][0])
+    return probe_magnitude(result, quota, "fable-5-1", 100, 0.0002, 0.02)
 
 
 @check("usage.result_shape", 2, "result usage has the expected fields (drift detector)")

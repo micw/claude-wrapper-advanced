@@ -173,8 +173,7 @@ Fensterlängen sind Konstanten (im CLI verdrahtet): `five_hour` = 18 000 s,
 
 ### 5.1 Das Header-Set ist modellabhängig
 
-Über einen lokalen Forwarder aufgezeichnet (`ANTHROPIC_BASE_URL` auf Loopback, siehe §7),
-18 Turns über vier Modelle:
+Ursprünglich über einen lokalen Forwarder, seit 2.1.252 direkt per Bun-Preload aufgezeichnet:
 
 | Turn auf | gemeldete Fenster |
 |---|---|
@@ -182,6 +181,12 @@ Fensterlängen sind Konstanten (im CLI verdrahtet): `five_hour` = 18 000 s,
 | `claude-opus-4-8` | `5h`, `7d` |
 | `claude-haiku-4-5` | `5h`, `7d` |
 | **`claude-fable-5`** | `5h`, `7d`, **`7d_oi`** |
+| **`claude-fable-5-1`** | `5h`, `7d`, **`7d_oi`** |
+
+Fable 5.0 und 5.1 wurden am selben Konto unmittelbar nacheinander mit CLI 2.1.258
+vermessen. Beide Antworten trugen `7d_oi` mit identischem Reset und Füllstand. Das ist
+damit ein Fenster der **Fable-Familie**, nicht ausschließlich der neuesten Modellversion.
+Die Modellregistry pflegt diese Zugehörigkeit explizit; der Usage-Scope nennt beide Modelle.
 
 Das Backend nennt pro Antwort genau die Fenster, die **diesen Request** begrenzen. Ein
 skopiertes Fenster erscheint nur auf Turns des betreffenden Modells — dieselbe Lücke, die

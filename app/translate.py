@@ -194,7 +194,15 @@ def messages_to_prompt(messages):
         "trust those results and do NOT call the same tool again for the same result. "
         "Call an available tool only when you need new information it provides.\n\n"
     )
-    closing = "\n\nRespond to the latest message now."
+    if messages and messages[-1].get("role") == "tool":
+        tool_name = id_to_name.get(messages[-1].get("tool_call_id"), "tool")
+        closing = (
+            f"\n\nThe latest item above is the completed output of {tool_name}, which has "
+            "already run for this request. Answer from that result now; do not run the same "
+            "tool again unless the user explicitly asks for fresh data."
+        )
+    else:
+        closing = "\n\nRespond to the latest message now."
 
     n_images = sum(len(imgs) for _, imgs in msgs)
     if n_images:

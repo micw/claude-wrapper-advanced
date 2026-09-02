@@ -55,6 +55,12 @@ class Models(unittest.TestCase):
         for alias, target in settings.aliases.items():
             self.assertIn(alias, by_id[target]["aliases"])
 
+    def test_limit_groups_are_model_metadata(self):
+        by_id = {m["id"]: m for m in self.models}
+        self.assertEqual(by_id["fable-5-1"]["limit_groups"], ["fable"])
+        self.assertEqual(by_id["fable-5"]["limit_groups"], ["fable"])
+        self.assertEqual(by_id["opus-5"]["limit_groups"], [])
+
     def test_backend_model_matches_the_cost_key(self):
         """done.cost.by_model ist nach dem CLI-Namen geschlüsselt — ohne ihn lässt sich eine
         Kostenzeile keinem Eintrag dieser Liste zuordnen."""

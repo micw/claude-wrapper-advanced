@@ -140,7 +140,7 @@ Mehr nicht, und das ist Absicht:
 ]}
 ```
 
-Der Unterschied zu `/v1/models`: dort werden aus sechs echten Modellen **vierzehn
+Der Unterschied zu `/v1/models`: dort werden aus sieben echten Modellen **fünfzehn
 Einträge**, weil vier Aliase und vier Effort-Picks (`opus:max`, `sonnet:low`, …) als
 Pseudo-Modelle mitlaufen — das braucht ein Model-Picker, der die Effort-Wahl über die
 Modellauswahl abbilden muss. Ein Konsument dieser API braucht das Gegenteil: jedes Modell
@@ -179,7 +179,8 @@ Fable-Stand älter ist.
        {"id":"seven_day", "upstream_id":"7d", "used_percent":73,
         "window_seconds":604800, "resets_at":1788412321}]},
     {"id":"model:fable-5", "upstream_id":"7d_oi",
-     "scope":{"models":["fable-5"]}, "observed_at":1787899000,
+     "scope":{"family":"fable", "models":["fable-5-1","fable-5"]},
+     "observed_at":1787899000,
      "age_seconds":4042,
      "windows":[{"id":"seven_day", "upstream_id":"7d_oi", "used_percent":1,
                  "window_seconds":604800, "resets_at":1788412321}]}

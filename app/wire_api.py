@@ -85,6 +85,7 @@ async def models(req: Request):
             "efforts": {"supported": list(levels), "default": default},
             "knowledge_cutoff": cutoff,
             "aliases": aliases.get(mid, []),
+            "limit_groups": list(settings.model_limit_groups.get(mid, ())),
         })
     return {"models": out}
 

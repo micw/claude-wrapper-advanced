@@ -148,6 +148,8 @@ class TestTextOnly(Base):
         self.assertIn("[System instructions]\nbe brief", t[1])
         self.assertIn("Assistant: [called tool get_weather with arguments", t[3])
         self.assertIn("Tool get_weather returned: 18C", t[4], "tool_call_id resolves to the name")
+        self.assertIn("completed output of get_weather", t[-1])
+        self.assertIn("do not run the same tool again", t[-1])
 
     def test_history_blocks_are_append_stable(self):
         """THE caching invariant: an extra turn must not touch earlier blocks byte-for-byte."""

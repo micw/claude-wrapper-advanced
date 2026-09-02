@@ -68,7 +68,7 @@ CLAUDE_TURN_HEADERS_FILE=/tmp/turn.jsonl \
 
 ## Live observation
 
-Verified with Claude Code 2.1.198, 2.1.220 and the wrapper's pinned 2.1.252, using
+Verified with Claude Code 2.1.198, 2.1.220, 2.1.252 and the wrapper's pinned 2.1.258, using
 real setup-token turns on 2026-09-01:
 
 - the preload ran and the turn completed normally;

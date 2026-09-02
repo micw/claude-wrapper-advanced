@@ -31,7 +31,9 @@ class WindowKeys(unittest.TestCase):
         self.assertIsNone(limits.window_key("seven_day_sonnet", None))
 
     def test_model_names_normalise_from_both_sides(self):
-        for name in ("Fable", "fable", "Fable 5", "claude-fable-5", "fable-5"):
+        for name in ("Fable", "fable", "Fable 5.1", "claude-fable-5-1", "fable-5-1"):
+            self.assertEqual(limits.model_key(name), "fable-5-1", name)
+        for name in ("Fable 5", "claude-fable-5", "fable-5"):
             self.assertEqual(limits.model_key(name), "fable-5", name)
 
     def test_unknown_model_is_passed_through(self):
@@ -49,11 +51,12 @@ class HeaderUsage(unittest.TestCase):
         limits._reset_observations()
 
     def test_global_and_fable_have_stable_and_upstream_ids(self):
-        result = limits.observe_turn_headers(HEADERS, "claude-fable-5", now=1000)
+        result = limits.observe_turn_headers(HEADERS, "claude-fable-5-1", now=1000)
         groups = {g["id"]: g for g in result["groups"]}
         self.assertEqual(groups["global"]["upstream_id"], None)
         self.assertEqual(groups["model:fable-5"]["upstream_id"], "7d_oi")
-        self.assertEqual(groups["model:fable-5"]["scope"], {"models": ["fable-5"]})
+        self.assertEqual(groups["model:fable-5"]["scope"], {
+            "family": "fable", "models": ["fable-5-1", "fable-5"]})
         windows = {w["id"]: w for w in groups["global"]["windows"]}
         self.assertEqual(windows["five_hour"]["upstream_id"], "5h")
         self.assertEqual(windows["five_hour"]["used_percent"], 8.0)
@@ -64,6 +67,14 @@ class HeaderUsage(unittest.TestCase):
         fable = next(g for g in result["groups"] if g["id"] == "model:fable-5")
         self.assertIsNone(fable["observed_at"])
         self.assertIsNone(fable["windows"][0]["used_percent"])
+
+    def test_both_fable_generations_update_the_shared_special_window(self):
+        for model in ("claude-fable-5-1", "claude-fable-5"):
+            with self.subTest(model=model):
+                limits._reset_observations()
+                result = limits.observe_turn_headers(HEADERS, model, now=1000)
+                fable = next(g for g in result["groups"] if g["id"] == "model:fable-5")
+                self.assertEqual(fable["windows"][0]["used_percent"], 4.0)
 
     def test_age_is_per_group(self):
         limits.observe_turn_headers(HEADERS, "claude-fable-5", now=1000)
