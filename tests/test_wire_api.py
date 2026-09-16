@@ -19,6 +19,24 @@ def call(endpoint):
     return asyncio.run(endpoint(FakeRequest()))
 
 
+class SessionId(unittest.TestCase):
+    def test_absent_is_none_and_nonempty_is_preserved(self):
+        self.assertIsNone(wire_api._session_id({}))
+        self.assertIsNone(wire_api._cost_scope_id({}))
+        self.assertEqual(wire_api._session_id({"session_id": "session-1"}), "session-1")
+        self.assertEqual(wire_api._cost_scope_id({"cost_scope_id": "turn-1"}), "turn-1")
+
+    def test_blank_non_string_and_overlong_values_are_rejected(self):
+        from fastapi import HTTPException
+        for name, parser in (("session_id", wire_api._session_id),
+                             ("cost_scope_id", wire_api._cost_scope_id)):
+            for value in (None, "", "   ", "x" * 129, 1, [], {}):
+                with self.subTest(name=name, value=value), self.assertRaises(HTTPException) as caught:
+                    parser({name: value})
+                self.assertEqual(caught.exception.status_code, 400)
+                self.assertEqual(caught.exception.detail["error"]["param"], name)
+
+
 class Info(unittest.TestCase):
     def test_carries_service_and_version(self):
         self.assertEqual(call(wire_api.info), {"service": SERVICE, "version": VERSION})

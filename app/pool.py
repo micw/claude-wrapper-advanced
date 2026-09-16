@@ -10,13 +10,15 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import time
+import uuid
 from collections import defaultdict, deque
 
 from . import wire
 from .config import settings
-from .cli_driver import (_build_args, _done, _overlong_evt, _timeout_evt, Overlong, Silent,
-                         TERMINAL, classify, read_line, spawn_cli)
+from .cli_driver import (_build_args, _cost, _done, _overlong_evt, _timeout_evt, Overlong,
+                         Silent, TERMINAL, classify, read_line, spawn_cli)
 
 log = logging.getLogger("pool")
 
@@ -57,6 +59,8 @@ class Proc:
         self.last_used = time.monotonic()
         self.dead = False
         self._cum_cost = 0.0   # total_cost_usd der CLI ist kumulativ pro Prozess
+        self._cost_epoch = str(uuid.uuid4())
+        self._pending_cost_scope_ids = []
 
     async def start(self):
         self.proc = await spawn_cli(self.args, self.model)
@@ -110,10 +114,58 @@ class Proc:
         except (asyncio.TimeoutError, EOFError, Overlong):
             self.dead = True  # konnte nicht sauber in den Idle-Zustand -> verwerfen
 
-    async def run_turn(self, prompt, stats):
+    def _defer_cost(self, cost_scope_id):
+        """Remember one request whose cumulative cost has not been reported yet."""
+        self._pending_cost_scope_ids.append(cost_scope_id)
+
+    def _settle_cost(self, stats, cost_scope_id):
+        """Turn a process-cumulative CLI value into an attributable request/turn delta."""
+        stats["cost_epoch"] = self._cost_epoch
+        total_cost = stats.get("cost_usd")
+        if (not isinstance(total_cost, (int, float)) or isinstance(total_cost, bool)
+                or not math.isfinite(total_cost) or total_cost < 0):
+            stats["cost_usd"] = None
+            stats["cost_scope"] = None
+            stats["cost_covered_requests"] = None
+            self._defer_cost(cost_scope_id)
+            return
+
+        if total_cost < self._cum_cost:
+            log.warning("total_cost_usd fiel von %s auf %s — neuer Kosten-Epoch, "
+                        "ausstehende Requests werden nicht zugeordnet",
+                        self._cum_cost, total_cost)
+            self._cost_epoch = str(uuid.uuid4())
+            self._cum_cost = max(0.0, total_cost)
+            self._pending_cost_scope_ids.clear()
+            stats["cost_usd"] = max(0.0, total_cost)
+            stats["cost_scope"] = None
+            stats["cost_covered_requests"] = None
+            stats["cost_epoch"] = self._cost_epoch
+            return
+
+        pending = self._pending_cost_scope_ids
+        covered = [*pending, cost_scope_id]
+        stats["cost_usd"] = max(0.0, total_cost - self._cum_cost)
+        self._cum_cost = max(self._cum_cost, total_cost)
+        if not pending:
+            stats["cost_scope"] = "call"
+            stats["cost_covered_requests"] = 1
+        elif cost_scope_id is not None and all(item == cost_scope_id for item in covered):
+            stats["cost_scope"] = "turn"
+            stats["cost_covered_requests"] = len(covered)
+            # modelUsage belongs to the final CLI result; it is not proven to cover the
+            # same deferred request set as the cumulative delta.
+            stats["model_usage"] = {}
+        else:
+            stats["cost_scope"] = None
+            stats["cost_covered_requests"] = None
+        self._pending_cost_scope_ids = []
+
+    async def run_turn(self, prompt, stats, session_id=None, cost_scope_id=None):
         """Ein Turn auf dieser (wiederverwendeten) Instanz. Async-Generator."""
         self.uses += 1
         stats["reused"] = self.uses > 1
+        stats["cost_epoch"] = self._cost_epoch
         t0 = time.perf_counter()
         loop = asyncio.get_running_loop()
 
@@ -178,6 +230,7 @@ class Proc:
                 if not events:
                     continue
                 if any(isinstance(e, wire.ToolCall) for e in events):
+                    self._defer_cost(cost_scope_id)
                     # Turn abbrechen (Prozess bleibt am Leben), Client bekommt den Call sofort.
                     # Known limitation: total_cost_usd steht NUR im result-Event, nicht in der
                     # assistant-Message -> die (nominalen) Kosten dieses Tool-Turns erscheinen erst
@@ -193,22 +246,16 @@ class Proc:
                     for event in events:   # Deltas, Denkfortschritt, Kontingent-Alarm
                         yield event
                     continue
-                # Kumulative CLI-Kosten -> Per-Turn-Delta umrechnen.
-                if isinstance(terminal, wire.Done) and stats.get("cost_usd") is not None:
-                    total_cost = stats["cost_usd"]
-                    if total_cost < self._cum_cost:
-                        # Sollte nicht passieren: total_cost_usd ist pro Prozess kumulativ und
-                        # überlebt /clear (siehe cost.cumulative in tests/assumptions.py). Wenn
-                        # die CLI das ändert, liefert die Delta-Rechnung ab hier stumm 0.0 —
-                        # das darf nicht unbemerkt bleiben.
-                        log.warning("total_cost_usd fiel von %s auf %s — Kumulativ-Annahme "
-                                    "verletzt, per-Request-cost ist ab jetzt unbrauchbar",
-                                    self._cum_cost, total_cost)
-                    stats["cost_usd"] = max(0.0, total_cost - self._cum_cost)
-                    self._cum_cost = max(self._cum_cost, total_cost)
-                    # Das Ereignis trägt die Kosten IN sich — nach der Delta-Rechnung neu
-                    # bauen, sonst nennt es den kumulativen Wert des Prozesses.
+                # Kumulative CLI-Kosten -> Delta mit expliziter Request-Coverage umrechnen.
+                # Auch ein Result ohne Kosten oder ein Fehler wird als ausstehend behalten,
+                # damit ein späteres kumulatives Delta nicht dem falschen Request gehört.
+                if "cost_usd" in stats:
+                    self._settle_cost(stats, cost_scope_id)
+                if isinstance(terminal, wire.Done):
+                    # Das Ereignis trägt die Kosten IN sich — nach Delta/Coverage neu bauen.
                     terminal = _done(stats, terminal.text)
+                elif isinstance(terminal, wire.Failed):
+                    terminal.cost = _cost(stats)
                 for event in events:
                     yield terminal if isinstance(event, TERMINAL) else event
                 return
@@ -338,7 +385,7 @@ pool = Pool()
 
 
 async def pooled_drive_turn(prompt, mcp_tools, model, stats, effort=None, system_prompt=None,
-                            append_system=None):
+                            append_system=None, session_id=None, cost_scope_id=None):
     # Bis zu 2 Versuche: eine idle gecrashte Instanz kann trotz Liveness-Check im Race
     # sterben. Retry ist nur sicher, SOLANGE noch nichts an den Client geflossen ist
     # (bei Streaming kann man Teil-Output nicht zurücknehmen).
@@ -349,7 +396,7 @@ async def pooled_drive_turn(prompt, mcp_tools, model, stats, effort=None, system
         stats["reused"] = reused
         if not reused:  # neue Instanz: Acquire = Spawn + Warmup-Init
             stats["spawn_ms"] = (time.perf_counter() - t_acq) * 1000
-        agen = p.run_turn(prompt, stats)
+        agen = p.run_turn(prompt, stats, session_id, cost_scope_id)
         completed = False
         yielded_any = False
         retry = False

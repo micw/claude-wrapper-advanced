@@ -112,6 +112,26 @@ async def _body(req: Request):
             "message": f"invalid JSON: {err}", "type": "invalid_request_error"}}) from None
 
 
+def _bounded_id(body, name):
+    """Validate an optional correlation id without forwarding it to Claude."""
+    if name not in body:
+        return None
+    value = body.get(name)
+    if not isinstance(value, str) or not value.strip() or len(value) > 128:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": f"'{name}' must be a non-empty string of at most 128 characters",
+            "type": "invalid_request_error", "code": "invalid_value", "param": name}})
+    return value
+
+
+def _session_id(body):
+    return _bounded_id(body, "session_id")
+
+
+def _cost_scope_id(body):
+    return _bounded_id(body, "cost_scope_id")
+
+
 @router.post("/responses")
 async def responses(req: Request):
     """Ein Turn als SSE. Jedes Ereignis ist ein JSON-Objekt in `data:`, der Typ steht im
@@ -129,6 +149,8 @@ async def responses(req: Request):
             "type": "server_error", "code": "not_authenticated"}})
 
     body = await _body(req)
+    session_id = _session_id(body)
+    cost_scope_id = _cost_scope_id(body)
     messages = body.get("messages") or []
     if not messages:
         raise HTTPException(status_code=400, detail={"error": {
@@ -151,7 +173,8 @@ async def responses(req: Request):
         t0 = time.perf_counter()
         try:
             async for event in drive_turn_events(prompt, mcp_tools, cli_model, stats,
-                                                 effort, system_prompt, append_system):
+                                                 effort, system_prompt, append_system,
+                                                 session_id, cost_scope_id):
                 yield "data: " + json.dumps(event.payload(), ensure_ascii=False) + "\n\n"
         except BaseException:
             # Weggeklickter Client ist kein Serverfehler — sonst zählt die Fehlerrate ihn mit.

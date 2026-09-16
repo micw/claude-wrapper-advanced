@@ -28,6 +28,8 @@ während codex' `input_tokens` die Treffer einschließt. Wer beide Wrapper bedie
 also nicht dieselbe Summe bilden — deshalb heißt das Feld `input_new` und die Summe steht
 ausgerechnet als `input_total` daneben.
 """
+import math
+import uuid
 from dataclasses import dataclass, field
 
 
@@ -139,16 +141,21 @@ class Failed(Event):
     message: str = ""
     upstream_status: int | None = None
     retryable: bool = False
+    cost: dict = field(default_factory=lambda: cost(None, {}))
 
 
 # ------------------------------------------------------------------ Projektionen
 
-def usage(raw, thinking=None):
+def usage(raw, thinking=None, thinking_basis=None):
     """CLI-Usage -> Wire-Usage.
 
     Die Cache-Aufteilung nach TTL (5m/1h) kommt aus `usage.cache_creation` und ist
     `None`, wo die CLI sie nicht mitschickt — nicht 0, das wäre eine Behauptung.
     """
+    if thinking_basis not in (None, "reported", "estimated"):
+        raise ValueError("thinking_basis must be reported, estimated, or None")
+    if thinking is None:
+        thinking_basis = None
     raw = raw or {}
     creation = raw.get("cache_creation") or {}
     new = raw.get("input_tokens") or 0
@@ -164,19 +171,56 @@ def usage(raw, thinking=None):
         "input_total": new + cached + written,
         "output": raw.get("output_tokens") or 0,
         "thinking": thinking,
+        "thinking_basis": thinking_basis,
         "service_tier": raw.get("service_tier"),
     }
 
 
-def cost(total_usd, by_model):
-    """Kosten des Turns.
+def cost(total_usd, by_model, scope=None, covered_requests=None, epoch=None):
+    """Nominale Kosten mit expliziter Zuordnungs-Coverage.
 
     `by_model` ist die Aufschlüsselung der CLI (`modelUsage`) und enthält gemessen auch
     **Fremdarbeit**: auf einem sonnet-Turn stand dort zusätzlich Haiku mit 522
-    Input-Tokens für CLI-interne Nebenaufrufe. `total_usd` ist also nicht die Kostenzahl
-    des Modell-Turns — die Aufschlüsselung ist der einzige Weg, das zu trennen.
+    Input-Tokens für CLI-interne Nebenaufrufe. Die Werte sind API-Listenpreise und kein Maß
+    für den Abo-Verbrauch.
 
-    Und: nominale API-Listenpreise. **Kein Maß für den Abo-Verbrauch** — kostengleich
-    gemessen bewegte Opus das Kontingent, Sonnet nicht (MESSUNGEN.md §5.2).
+    `scope` ist nur `call`, wenn genau dieser Request abgedeckt ist, oder `turn`, wenn das
+    Delta mehrere Requests derselben expliziten Session abdeckt. Ohne sichere Zuordnung
+    bleiben Scope und Anzahl null. `epoch` identifiziert den besitzenden CLI-Prozess und ist
+    opak; nach einem beobachteten Kosten-Counter-Reset wechselt es.
     """
-    return {"total_usd": total_usd, "by_model": by_model or {}}
+    if by_model is None:
+        by_model = {}
+    if not isinstance(by_model, dict):
+        raise ValueError("by_model must be an object")
+    if total_usd is not None and (not isinstance(total_usd, (int, float))
+                                  or isinstance(total_usd, bool)
+                                  or not math.isfinite(total_usd) or total_usd < 0):
+        raise ValueError("total_usd must be a finite non-negative number or None")
+    if epoch is not None:
+        if not isinstance(epoch, str):
+            raise ValueError("cost epoch must be a UUID string or None")
+        try:
+            parsed_epoch = uuid.UUID(epoch)
+        except (ValueError, AttributeError):
+            raise ValueError("cost epoch must be a UUID string or None") from None
+        if str(parsed_epoch) != epoch:
+            raise ValueError("cost epoch must use canonical UUID spelling")
+    if total_usd is None:
+        scope, covered_requests = None, None
+    elif epoch is None:
+        raise ValueError("known cost requires a cost epoch")
+    if scope not in (None, "call", "turn"):
+        raise ValueError("cost scope must be call, turn, or None")
+    if covered_requests is not None and (not isinstance(covered_requests, int)
+                                         or isinstance(covered_requests, bool)
+                                         or covered_requests <= 0):
+        raise ValueError("covered_requests must be a positive integer or None")
+    if scope == "call" and covered_requests != 1:
+        raise ValueError("call cost must cover exactly one request")
+    if scope == "turn" and (covered_requests is None or covered_requests < 2):
+        raise ValueError("turn cost must cover at least two requests")
+    if scope is None:
+        covered_requests = None
+    return {"total_usd": total_usd, "by_model": by_model,
+            "scope": scope, "covered_requests": covered_requests, "epoch": epoch}

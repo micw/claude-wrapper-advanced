@@ -27,8 +27,11 @@ Zwei Gründe, beide aus der Praxis:
 ## 2. `POST /wire/v1/responses`
 
 Nimmt dieselben `messages`, `tools`, `model` und `reasoning_effort` entgegen wie
-`/v1/chat/completions` — die Übersetzung nach innen ist identisch, unterschiedlich ist
-nur, was herauskommt.
+`/v1/chat/completions`. Optional identifiziert `session_id` die längere Consumer-Session;
+`cost_scope_id` identifiziert davon getrennt den logischen Turn, dessen Tool-Schritte ein
+späteres kumulatives Kostendelta gemeinsam abdecken darf. Beide sind nichtleere, auf 128
+Zeichen begrenzte Korrelationskennungen und werden nie an Claude weitergegeben. Die
+Übersetzung nach innen ist ansonsten identisch, unterschiedlich ist nur, was herauskommt.
 
 Antwort ist SSE. Jedes Ereignis ist ein JSON-Objekt in `data:`, der Typ steht im Feld
 `type`. **Kein `event:`-Feld**, damit der Konsument nur an einer Stelle nachsieht. Bricht
@@ -52,7 +55,7 @@ data: {"type":"done","stop_reason":"end_turn","text":"OK","usage":{…},"cost":{
 | `limit_status` | `window`, `claim`, `status`, `resets_at`, `surpassed_threshold`, `overage`, `usage_stale` | nur im Alarmfall, s.u. |
 | `quota` | `usage` | vollständiger letzter Kontingent-Snapshot nach frischen Turn-Response-Headern |
 | `done` | `stop_reason`, `text`, `usage`, `cost`, `timing` | sauberes Ende — **auch nach einem Tool-Call**, s.u. |
-| `failed` | `error_type`, `message`, `upstream_status`, `retryable` | getrennt von `done`, weil Fehler und Ende zwei Fälle sind |
+| `failed` | `error_type`, `message`, `upstream_status`, `retryable`, `cost` | getrennt von `done`, weil Fehler und Ende zwei Fälle sind; numerische Kosten eines fehlgeschlagenen CLI-Resultats bleiben erhalten |
 
 ### Jeder Turn endet mit `done` oder `failed` — auch ein Tool-Turn
 
@@ -67,9 +70,14 @@ die Usage steht dort nur in `message_start` und in der assistant-Message. Ohne d
 `done` verlöre ein Wire-Konsument die Tokenzahlen jedes Tool-Turns — und in einer
 Agentenschleife ist das die Mehrzahl aller Turns.
 
-`cost.total_usd` ist dabei `null`: `total_cost_usd` liefert die CLI nur im `result`, der
-Kostenanteil eines Tool-Turns erscheint deshalb erst im nächsten vollen Turn. Kumulativ
-korrekt, pro Turn verschoben — bekannt und nicht behebbar, solange die CLI es so meldet.
+`cost.total_usd`, `scope` und `covered_requests` sind dabei `null`: `total_cost_usd`
+liefert die CLI nur im `result`. Der besitzende Pool-Prozess merkt den Request bis zum
+nächsten vollen Resultat; nur wenn alle so abgedeckten Requests dieselbe nichtleere
+`cost_scope_id` tragen, markiert er das spätere Delta als `scope: "turn"`. Diese optionale
+Kennung identifiziert einen logischen Agent-Turn und bleibt über dessen Tool-Schritte stabil;
+`session_id` bleibt davon getrennt und identifiziert nur die längere Session. Bei fehlender
+oder gemischter Turn-Identität bleibt der Scope null und ein Consumer darf den Betrag nicht
+zurechnen.
 
 Der Tupel-Adapter für die OpenAI-Oberflächen unterdrückt dieses `done`: dort ist der
 Tool-Call selbst der Abschluss, und ein zusätzliches leeres Ergebnis würde an jedem
@@ -80,7 +88,8 @@ Tool-Call eine leere Antwort erzeugen. `tests/test_legacy_adapter.py` nagelt das
 ```json
 {"input_new": 2, "cache_read": 3219, "cache_write": 5507,
  "cache_write_5m": 0, "cache_write_1h": 5507,
- "input_total": 8728, "output": 6, "thinking": 490, "service_tier": "standard"}
+ "input_total": 8728, "output": 6, "thinking": 490,
+ "thinking_basis": "reported", "service_tier": "standard"}
 ```
 
 **`input_new` enthält die Cache-Treffer NICHT.** Die CLI meldet `input_tokens` als den
@@ -90,13 +99,17 @@ abweichenden Namen und die ausgerechnete Summe `input_total` daneben. Wer beide 
 bedient, darf nicht dieselbe Addition bauen.
 
 `thinking` ist die **echte** Zahl aus `message_delta`, wo der Turn eine liefert, sonst die
-Summe der Schätzungen (gemessen: 490 echt gegen 450 geschätzt). `cache_write_5m` / `_1h`
-sind `None`, wo die CLI die Aufteilung nicht mitschickt — nicht 0, das wäre eine Behauptung.
+Summe der Schätzungen (gemessen: 490 echt gegen 450 geschätzt). `thinking_basis` nennt diese
+Herkunft als `reported` oder `estimated`; ohne Zahl sind beide Felder null. Ein Consumer darf
+eine geschätzte Abschlusszahl nicht als gemessene Token-Usage ausgeben. `cache_write_5m` /
+`_1h` sind `None`, wo die CLI die Aufteilung nicht mitschickt — nicht 0, das wäre eine
+Behauptung.
 
 ### `cost` im `done`
 
 ```json
-{"total_usd": 0.0035, "by_model": {"claude-sonnet-5": {…}, "claude-haiku-4-5-…": {…}}}
+{"total_usd": 0.0035, "by_model": {"claude-sonnet-5": {…}, "claude-haiku-4-5-…": {…}},
+ "scope": "call", "covered_requests": 1, "epoch": "8e6f…"}
 ```
 
 Zwei Warnungen, die im Feld selbst nicht stehen können:
@@ -106,6 +119,16 @@ Zwei Warnungen, die im Feld selbst nicht stehen können:
   Aufschlüsselung ist der einzige Weg, das zu trennen.
 - **Es sind nominale API-Listenpreise und kein Maß für den Abo-Verbrauch.** Kostengleich
   gemessen bewegte Opus das Kontingent, Sonnet nicht (MESSUNGEN.md §5.2).
+
+`scope: "call"` deckt genau den aktuellen Request ab. `scope: "turn"` deckt mehrere
+aufeinanderfolgende Requests derselben `cost_scope_id` innerhalb genau eines Pool-Prozesses
+ab; `covered_requests` nennt deren Anzahl. Für diesen Mehr-Request-Fall ist `by_model` leer,
+weil die CLI-Aufschlüsselung des letzten Resultats nicht nachweislich dasselbe Intervall wie
+das kumulative Kostendelta deckt. `scope: null` bedeutet ausdrücklich, dass der Betrag nicht
+sicher zurechenbar ist; die OpenAI-kompatiblen Oberflächen unterdrücken ihn deshalb. `epoch` ist eine opake, pro Pool-Prozess stabile
+Kennung und wechselt, wenn der kumulative CLI-Counter unerwartet zurückspringt. Neustart,
+Eviction oder ein unklar abgebrochener Prozess verwerfen ausstehende Coverage, statt sie
+auf einen anderen Prozess zu übertragen.
 
 ---
 

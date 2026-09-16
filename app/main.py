@@ -82,7 +82,7 @@ def _usage_out(stats):
     """usage-Objekt für die Response; hängt (OpenRouter-Stil) 'cost' an, wenn bekannt."""
     usage = dict(stats.get("usage") or _ZERO_USAGE)
     cost = stats.get("cost_usd")
-    if cost is not None:
+    if cost is not None and stats.get("cost_scope") == "call":
         usage["cost"] = cost
     think = stats.get("thinking_tokens")
     if think:                                  # OpenAI-Standardort im Chat-Format; gedeckelt wie
@@ -452,8 +452,9 @@ async def responses_cancel(response_id: str):
 
 def _rsp_ctx(stats, echo):
     """Envelope-Felder, die aus Request-Kontext und Turn-Statistik kommen."""
+    cost = stats.get("cost_usd") if stats.get("cost_scope") == "call" else None
     return {"usage": stats.get("usage"), "thinking_tokens": stats.get("thinking_tokens", 0),
-            "cost": stats.get("cost_usd"), **echo}
+            "cost": cost, **echo}
 
 
 async def _responses_stream(rid, req_model, prompt, mcp_tools, cli_model, stats, effort, echo,

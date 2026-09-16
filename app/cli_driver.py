@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 
@@ -116,6 +117,10 @@ def _capture_result(m, stats):
     stats["usage"] = _usage_obj(m.get("usage"))
     stats["usage_raw"] = m.get("usage") or {}
     stats["cost_usd"] = m.get("total_cost_usd")
+    if stats["cost_usd"] is not None:
+        stats.setdefault("cost_scope", "call")
+        stats.setdefault("cost_covered_requests", 1)
+        stats.setdefault("cost_epoch", str(uuid.uuid4()))
     # Aufschlüsselung pro Modell. Enthält gemessen auch CLI-interne Nebenaufrufe
     # (Haiku), ist also der einzige Weg, die Kosten des Modell-Turns zu isolieren.
     stats["model_usage"] = m.get("modelUsage") or {}
@@ -125,13 +130,28 @@ def _capture_result(m, stats):
     stats["num_turns"] = m.get("num_turns")
 
 
+def _thinking_basis(stats):
+    if stats.get("thinking_tokens_source") == "api":
+        return "reported"
+    if "thinking_tokens_estimated" in stats:
+        return "estimated"
+    return None
+
+
+def _cost(stats):
+    return wire.cost(stats.get("cost_usd"), stats.get("model_usage"),
+                     stats.get("cost_scope"), stats.get("cost_covered_requests"),
+                     stats.get("cost_epoch"))
+
+
 def _done(stats, text):
     """Das Abschlussereignis aus dem, was der Turn gesammelt hat."""
     return wire.Done(
         stop_reason=stats.get("stop_reason"),
         text=text,
-        usage=wire.usage(stats.get("usage_raw"), stats.get("thinking_tokens")),
-        cost=wire.cost(stats.get("cost_usd"), stats.get("model_usage")),
+        usage=wire.usage(stats.get("usage_raw"), stats.get("thinking_tokens"),
+                         _thinking_basis(stats)),
+        cost=_cost(stats),
         timing={
             "cli_ms": stats.get("cli_duration_ms"),
             "ttft_ms": stats.get("ttft_ms"),
@@ -234,7 +254,8 @@ def classify(m, stats, mark_ttft, model=None):
             # api_error_status trägt den echten Upstream-Status (z.B. 404 bei Modellfehlern).
             return [wire.Failed(error_type="cli_error",
                                 message=(m.get("result") or m.get("subtype") or "cli error"),
-                                upstream_status=m.get("api_error_status"))]
+                                upstream_status=m.get("api_error_status"),
+                                cost=_cost(stats))]
         stats["outcome"] = "final"
         return [_done(stats, m.get("result") or "")]
     return []
@@ -320,9 +341,10 @@ TERMINAL = (wire.ToolCall, wire.Done, wire.Failed)
 
 
 async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_prompt=None,
-                        append_system=None):
+                        append_system=None, session_id=None, cost_scope_id=None):
     """Eine frische CLI pro Request (kein Reuse)."""
     t0 = time.perf_counter()
+    stats["cost_epoch"] = str(uuid.uuid4())
     proc = await spawn_cli(_build_args(mcp_tools, model, effort, system_prompt, append_system), model)
     stats["spawn_ms"] = (time.perf_counter() - t0) * 1000
     stats["reused"] = False
@@ -406,16 +428,18 @@ async def _oneshot_turn(prompt, mcp_tools, model, stats, effort=None, system_pro
 
 
 async def drive_turn_events(prompt, mcp_tools, model, stats, effort=None, system_prompt=None,
-                            append_system=None):
+                            append_system=None, session_id=None, cost_scope_id=None):
     """Öffentliche Schnittstelle: der Wire-Strom. Pool (Reuse) oder One-Shot je nach Config."""
     if settings.pool_enabled:
         from .pool import pooled_drive_turn  # lazy: vermeidet Zirkularimport
         async for ev in pooled_drive_turn(prompt, mcp_tools, model, stats, effort,
-                                          system_prompt, append_system):
+                                          system_prompt, append_system, session_id,
+                                          cost_scope_id):
             yield ev
     else:
         async for ev in _oneshot_turn(prompt, mcp_tools, model, stats, effort,
-                                      system_prompt, append_system):
+                                      system_prompt, append_system, session_id,
+                                      cost_scope_id):
             yield ev
 
 

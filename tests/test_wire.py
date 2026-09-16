@@ -44,6 +44,8 @@ TOOL_USE = {"type": "assistant", "message": {"usage": {"input_tokens": 10, "outp
 MODEL_ERROR = {"type": "result", "is_error": True, "result": "model not found",
                "subtype": "success", "api_error_status": 404}
 
+COST_EPOCH = "00000000-0000-4000-8000-000000000001"
+
 RATE_LIMIT_OK = {"type": "rate_limit_event", "rate_limit_info": {
     "status": "allowed", "resetsAt": 1787909400, "rateLimitType": "five_hour",
     "overageStatus": "rejected", "overageDisabledReason": "org_level_disabled",
@@ -87,6 +89,26 @@ class Vocabulary(unittest.TestCase):
         self.assertEqual(done.timing["cli_ms"], 1567)
         # Fremdarbeit sichtbar: der Haiku-Nebenaufruf steckt in total_usd mit drin.
         self.assertIn("claude-haiku-4-5-20251001", done.cost["by_model"])
+        self.assertEqual(done.cost["scope"], "call")
+        self.assertEqual(done.cost["covered_requests"], 1)
+        self.assertRegex(done.cost["epoch"], r"^[0-9a-f-]{36}$")
+        self.assertIsNone(done.usage["thinking_basis"])
+
+    def test_cost_coverage_contract_rejects_contradictions(self):
+        self.assertEqual(wire.cost(None, {}, "call", 1, COST_EPOCH), {
+            "total_usd": None, "by_model": {}, "scope": None,
+            "covered_requests": None, "epoch": COST_EPOCH,
+        })
+        for args in (
+            (True, {}, "call", 1, COST_EPOCH),
+            (-1, {}, "call", 1, COST_EPOCH),
+            (0.1, [], "call", 1, COST_EPOCH),
+            (0.1, {}, "call", 1, "not-a-uuid"),
+            (0.1, {}, "call", 2, COST_EPOCH),
+            (0.1, {}, "turn", 1, COST_EPOCH),
+        ):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                wire.cost(*args)
 
     def test_input_new_excludes_cache_hits(self):
         """Abweichung zum codex-Wrapper, bewusst benannt: dort schließt input die Treffer ein."""
@@ -101,13 +123,17 @@ class Vocabulary(unittest.TestCase):
         only(MESSAGE_DELTA, stats)           # echt: 490
         self.assertEqual(stats["thinking_tokens"], 490)
         self.assertEqual(stats["thinking_tokens_estimated"], 200)
-        self.assertEqual(only(RESULT, stats)[0].usage["thinking"], 490)
+        done = only(RESULT, stats)[0]
+        self.assertEqual(done.usage["thinking"], 490)
+        self.assertEqual(done.usage["thinking_basis"], "reported")
 
     def test_estimate_survives_a_turn_without_message_delta(self):
         """Tool-Turns und Abbrüche sehen nie ein message_delta."""
         stats = {}
         only(THINKING_DELTA, stats)
         self.assertEqual(stats["thinking_tokens"], 200)
+        done = only(TOOL_USE, stats)[1]
+        self.assertEqual(done.usage["thinking_basis"], "estimated")
 
     def test_tool_call_is_normalised(self):
         events = only(TOOL_USE)
@@ -121,11 +147,21 @@ class Vocabulary(unittest.TestCase):
         self.assertEqual(done.type, "done")
         self.assertEqual(done.stop_reason, "tool_use")
         self.assertEqual(done.usage["input_total"], 10)
+        self.assertIsNone(done.cost["total_usd"])
+        self.assertIsNone(done.cost["scope"])
+        self.assertIsNone(done.cost["covered_requests"])
 
-    def test_failure_keeps_the_upstream_status(self):
+    def test_failure_keeps_the_upstream_status_and_numeric_cost(self):
         event = only(MODEL_ERROR)[0]
         self.assertEqual(event.type, "failed")
         self.assertEqual(event.upstream_status, 404)
+        self.assertIsNone(event.cost["total_usd"])
+
+        charged = only({**RESULT, "is_error": True, "result": "charged failure"})[0]
+        self.assertEqual(charged.type, "failed")
+        self.assertEqual(charged.cost["total_usd"], RESULT["total_cost_usd"])
+        self.assertEqual(charged.cost["scope"], "call")
+        self.assertEqual(charged.cost["covered_requests"], 1)
 
     def test_quiet_rate_limit_emits_nothing(self):
         """Der Normalfall ist kein Ereignis — sonst käme bei jedem Turn eines."""

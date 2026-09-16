@@ -48,7 +48,7 @@ genuine drop-in OpenAI backend:
   is **always appended** on top via `--append-system-prompt` (it wins on conflict) and is part of the
   pool bucket key. Tool-use survives (the contract lives in `tools[]`, not the prompt) and today's
   date reaches the model via a `<system-reminder>` in the user turn.
-- **Real usage & cost** — OpenAI `usage` plus an OpenRouter-style `cost`, with cache read/write token stats.
+- **Real usage & nominal cost** — OpenAI `usage` plus an OpenRouter-style virtual list-price `cost`, with cache read/write token stats and explicit call/turn/null coverage.
 - **Observability** — `/metrics` exposes latency bands (ttft / spawn / overhead), cache hit-rate and
   every quota window the account has, each keeping its own last reading.
 - **Quota as a first-class surface** — a fail-open Bun preload captures the official CLI turn's
@@ -275,7 +275,7 @@ Always run the curl quick test before testing in the editor.
   asyncio's 64 KiB default — that default cut off large multi-file answers mid-stream. A line
   beyond the limit still ends the turn (the buffer is unrecoverable), but as an `overlong_line`
   error event, not as a truncated response body.
-- Per-request `cost` in `usage` is distorted for tool-call turns (cumulative cost is correct); see the pool notes in the code.
+- Claude reports `total_cost_usd` only on a full result. Native Wire therefore marks a direct result as `scope: call`, a tool chain as `scope: turn` only when every deferred request names the same `session_id`, and every ambiguous delta as `scope: null`; consumers must not attribute null-scope cost.
 - **A model can emit tool arguments that are not JSON**, and the CLI then hands us
   `{"__unparsedToolInput": {"raw": "…", "len": N}}` instead of the arguments. That marker is
   *not* forwarded as an argument object — doing so produces valid JSON, the client executes
