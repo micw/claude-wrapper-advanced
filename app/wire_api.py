@@ -185,7 +185,9 @@ async def responses(req: Request):
             metrics.end(stats.get("outcome") or "error", total_ms=total_ms,
                         ttft_ms=stats.get("ttft_ms"), spawn_ms=stats.get("spawn_ms"),
                         cli_dur_ms=stats.get("cli_duration_ms"), usage=stats.get("usage"),
-                        model=req_model, reasoning_tokens=stats.get("thinking_tokens"))
+                        model=req_model, reasoning_tokens=stats.get("thinking_tokens"),
+                        cost_usd=stats.get("cost_usd"), cost_scope=stats.get("cost_scope"),
+                        cost_covered_requests=stats.get("cost_covered_requests"))
             log.info("wire model=%s outcome=%s reused=%s total=%.0fms",
                      cli_model, stats.get("outcome"), stats.get("reused"), total_ms)
 

@@ -145,7 +145,9 @@ def _record(model, stream, stats, total_ms):
     metrics.end(stats.get("outcome") or "error", total_ms=total_ms,
                 ttft_ms=stats.get("ttft_ms"), spawn_ms=stats.get("spawn_ms"),
                 cli_dur_ms=stats.get("cli_duration_ms"), usage=stats.get("usage"), model=model,
-                reasoning_tokens=stats.get("thinking_tokens"))
+                reasoning_tokens=stats.get("thinking_tokens"), cost_usd=stats.get("cost_usd"),
+                cost_scope=stats.get("cost_scope"),
+                cost_covered_requests=stats.get("cost_covered_requests"))
     _log_req(model, stream, stats, total_ms)
 
 

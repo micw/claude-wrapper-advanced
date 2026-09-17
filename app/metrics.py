@@ -1,4 +1,5 @@
 """Lightweight in-memory metrics for operations and subscription analysis."""
+import math
 import time
 from collections import defaultdict, deque
 
@@ -30,6 +31,9 @@ class Metrics:
         self.output_toks = 0
         self.reasoning_toks = 0
         self.models = defaultdict(lambda: defaultdict(int))
+        self.nominal_cost_usd = defaultdict(float)
+        self.cost_observations = defaultdict(int)
+        self.cost_covered_requests = defaultdict(int)
         # Kontingent, pro Gruppe akkumuliert (aus rate_limit_event). Siehe update_rate_limit().
         self.limit_groups = {}
         self.limit_state = None
@@ -84,7 +88,8 @@ class Metrics:
         self.total_requests += 1
 
     def end(self, outcome, total_ms=None, ttft_ms=None, spawn_ms=None, cli_dur_ms=None,
-            usage=None, model=None, reasoning_tokens=None):
+            usage=None, model=None, reasoning_tokens=None, cost_usd=None, cost_scope=None,
+            cost_covered_requests=None):
         self.inflight = max(0, self.inflight - 1)
         self.counts[outcome or "unknown"] += 1
         model_stats = self.models[model or "unknown"]
@@ -107,6 +112,14 @@ class Metrics:
             model_stats["cache_write"] += cache_write
             model_stats["output"] += output
             model_stats["reasoning"] += reasoning
+        if (isinstance(cost_usd, (int, float)) and not isinstance(cost_usd, bool)
+                and math.isfinite(cost_usd) and cost_usd >= 0):
+            scope = cost_scope if cost_scope in ("call", "turn") else "unattributed"
+            self.nominal_cost_usd[scope] += cost_usd
+            self.cost_observations[scope] += 1
+            if (scope != "unattributed" and isinstance(cost_covered_requests, int)
+                    and not isinstance(cost_covered_requests, bool) and cost_covered_requests > 0):
+                self.cost_covered_requests[scope] += cost_covered_requests
         if total_ms is not None:
             self.total.append(total_ms)
         if ttft_ms is not None:
@@ -157,6 +170,14 @@ class Metrics:
                 "reasoning": self.reasoning_toks,
             },
             "models": {name: dict(values) for name, values in self.models.items()},
+            "cost": {
+                "kind": "nominal_api_list_price",
+                "currency": "USD",
+                "total_usd": round(sum(self.nominal_cost_usd.values()), 12),
+                "by_scope_usd": dict(self.nominal_cost_usd),
+                "observations": dict(self.cost_observations),
+                "covered_requests": dict(self.cost_covered_requests),
+            },
             "latency_ms": {
                 "total": band(self.total),      # inkl. Spawn + Inferenz
                 "ttft": band(self.ttft),        # bis erstes Token
@@ -195,6 +216,22 @@ class Metrics:
             for kind in ("input_uncached", "cache_read", "cache_write", "output", "reasoning"):
                 lines.append(_sample("subscription_wrapper_tokens_total", stats[kind],
                                      provider="claude", model=model, type=kind))
+        lines += [
+            "# HELP subscription_wrapper_nominal_cost_usd_total Provider-reported nominal API list-price cost, not subscription billing.",
+            "# TYPE subscription_wrapper_nominal_cost_usd_total counter",
+            "# HELP subscription_wrapper_cost_observations_total Cost deltas reported by attribution scope.",
+            "# TYPE subscription_wrapper_cost_observations_total counter",
+            "# HELP subscription_wrapper_cost_covered_requests_total Requests covered by attributable cost deltas.",
+            "# TYPE subscription_wrapper_cost_covered_requests_total counter",
+        ]
+        for scope, cost in sorted(self.nominal_cost_usd.items()):
+            labels = {"provider": "claude", "scope": scope}
+            lines.append(_sample("subscription_wrapper_nominal_cost_usd_total", cost, **labels))
+            lines.append(_sample("subscription_wrapper_cost_observations_total",
+                                 self.cost_observations[scope], **labels))
+            if scope != "unattributed":
+                lines.append(_sample("subscription_wrapper_cost_covered_requests_total",
+                                     self.cost_covered_requests[scope], **labels))
         lines += [
             "# HELP subscription_wrapper_quota_used_ratio Used fraction of a subscription quota window.",
             "# TYPE subscription_wrapper_quota_used_ratio gauge",

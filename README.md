@@ -234,8 +234,11 @@ curl -s localhost:8000/metrics/prometheus
 `/metrics/prometheus` exposes cumulative token counters by canonical model and category
 (`input_uncached`, `cache_read`, `cache_write`, `output`, `reasoning`). Quota gauges come from the
 response-header cache used by `/wire/v1/usage`, including group, window length, reset and observation
-timestamps. Scraping never starts a quota probe; ordinary turns refresh the gauges and unknown values
-are omitted rather than reported as zero. Counters reset when the wrapper process restarts.
+timestamps. It also exports Claude's nominal API list-price cost deltas by attribution scope
+(`call`, `turn`, or `unattributed`), plus observation and covered-request counters. These values are
+not subscription billing. Scraping never starts a quota probe; ordinary turns refresh the gauges and
+unknown values are omitted rather than reported as zero. Counters reset when the wrapper process
+restarts.
 
 ## VS Code / Copilot
 
