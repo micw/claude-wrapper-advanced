@@ -8,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import responses as rsp
 from .auth import auth_status
@@ -144,7 +144,8 @@ def _log_req(model, stream, stats, total_ms):
 def _record(model, stream, stats, total_ms):
     metrics.end(stats.get("outcome") or "error", total_ms=total_ms,
                 ttft_ms=stats.get("ttft_ms"), spawn_ms=stats.get("spawn_ms"),
-                cli_dur_ms=stats.get("cli_duration_ms"), usage=stats.get("usage"))
+                cli_dur_ms=stats.get("cli_duration_ms"), usage=stats.get("usage"), model=model,
+                reasoning_tokens=stats.get("thinking_tokens"))
     _log_req(model, stream, stats, total_ms)
 
 
@@ -167,6 +168,13 @@ async def get_metrics():
         from .pool import pool
         snap["pool"] = pool.snapshot()
     return snap
+
+
+@app.get("/metrics/prometheus")
+async def get_prometheus_metrics():
+    from .limits import quota_snapshot
+    return PlainTextResponse(metrics.prometheus(quota_snapshot()),
+                             media_type="text/plain; version=0.0.4")
 
 
 def _model_obj(mid, name, ctx, levels, input_modalities, now, pinned=None):

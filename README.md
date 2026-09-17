@@ -226,7 +226,16 @@ curl -sN localhost:8000/v1/chat/completions -H 'content-type: application/json' 
   "model":"sonnet","stream":true,
   "messages":[{"role":"user","content":"Count from 1 to 5."}]
 }'
+
+# Prometheus exposition (the existing /metrics endpoint remains JSON)
+curl -s localhost:8000/metrics/prometheus
 ```
+
+`/metrics/prometheus` exposes cumulative token counters by canonical model and category
+(`input_uncached`, `cache_read`, `cache_write`, `output`, `reasoning`). Quota gauges come from the
+response-header cache used by `/wire/v1/usage`, including group, window length, reset and observation
+timestamps. Scraping never starts a quota probe; ordinary turns refresh the gauges and unknown values
+are omitted rather than reported as zero. Counters reset when the wrapper process restarts.
 
 ## VS Code / Copilot
 

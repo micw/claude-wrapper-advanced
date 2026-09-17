@@ -1,4 +1,4 @@
-"""Leichtgewichtige In-Memory-Metriken (für Latenz-/Durchsatz-Debugging)."""
+"""Lightweight in-memory metrics for operations and subscription analysis."""
 import time
 from collections import defaultdict, deque
 
@@ -27,6 +27,9 @@ class Metrics:
         self.cache_read = 0
         self.cache_write = 0
         self.prompt_toks = 0
+        self.output_toks = 0
+        self.reasoning_toks = 0
+        self.models = defaultdict(lambda: defaultdict(int))
         # Kontingent, pro Gruppe akkumuliert (aus rate_limit_event). Siehe update_rate_limit().
         self.limit_groups = {}
         self.limit_state = None
@@ -80,14 +83,30 @@ class Metrics:
         self.inflight += 1
         self.total_requests += 1
 
-    def end(self, outcome, total_ms=None, ttft_ms=None, spawn_ms=None, cli_dur_ms=None, usage=None):
+    def end(self, outcome, total_ms=None, ttft_ms=None, spawn_ms=None, cli_dur_ms=None,
+            usage=None, model=None, reasoning_tokens=None):
         self.inflight = max(0, self.inflight - 1)
         self.counts[outcome or "unknown"] += 1
+        model_stats = self.models[model or "unknown"]
+        model_stats["requests"] += 1
         if usage:
             ptd = usage.get("prompt_tokens_details") or {}
-            self.cache_read += ptd.get("cached_tokens") or 0
-            self.cache_write += ptd.get("cache_write_tokens") or 0
-            self.prompt_toks += usage.get("prompt_tokens") or 0
+            prompt = usage.get("prompt_tokens") or 0
+            cache_read = ptd.get("cached_tokens") or 0
+            cache_write = ptd.get("cache_write_tokens") or 0
+            output = usage.get("completion_tokens") or 0
+            reasoning = reasoning_tokens or 0
+            uncached = max(0, prompt - cache_read - cache_write)
+            self.cache_read += cache_read
+            self.cache_write += cache_write
+            self.prompt_toks += prompt
+            self.output_toks += output
+            self.reasoning_toks += reasoning
+            model_stats["input_uncached"] += uncached
+            model_stats["cache_read"] += cache_read
+            model_stats["cache_write"] += cache_write
+            model_stats["output"] += output
+            model_stats["reasoning"] += reasoning
         if total_ms is not None:
             self.total.append(total_ms)
         if ttft_ms is not None:
@@ -130,6 +149,14 @@ class Metrics:
                 "write_tokens": self.cache_write,   # Cache-Writes (teuer, einmalig pro Präfix)
                 "prompt_tokens": self.prompt_toks,
             },
+            "tokens": {
+                "input_uncached": max(0, self.prompt_toks - self.cache_read - self.cache_write),
+                "cache_read": self.cache_read,
+                "cache_write": self.cache_write,
+                "output": self.output_toks,
+                "reasoning": self.reasoning_toks,
+            },
+            "models": {name: dict(values) for name, values in self.models.items()},
             "latency_ms": {
                 "total": band(self.total),      # inkl. Spawn + Inferenz
                 "ttft": band(self.ttft),        # bis erstes Token
@@ -141,6 +168,71 @@ class Metrics:
             # Gesamtzustand. Füllstände nur, wo das Backend sie mitschickt (Warnung/429).
             "limits": limits,
         }
+
+    def prometheus(self, quota):
+        """Render cumulative token counters and canonical quota gauges for scraping."""
+        lines = [
+            "# HELP subscription_wrapper_info Static wrapper identity.",
+            "# TYPE subscription_wrapper_info gauge",
+            'subscription_wrapper_info{provider="claude"} 1',
+            "# HELP subscription_wrapper_uptime_seconds Process uptime.",
+            "# TYPE subscription_wrapper_uptime_seconds gauge",
+            f"subscription_wrapper_uptime_seconds{{provider=\"claude\"}} {time.time() - self.started:.3f}",
+            "# HELP subscription_wrapper_inflight_requests Requests currently running.",
+            "# TYPE subscription_wrapper_inflight_requests gauge",
+            f'subscription_wrapper_inflight_requests{{provider="claude"}} {self.inflight}',
+            "# HELP subscription_wrapper_requests_total Requests by terminal outcome.",
+            "# TYPE subscription_wrapper_requests_total counter",
+        ]
+        for outcome, count in sorted(self.counts.items()):
+            lines.append(_sample("subscription_wrapper_requests_total", count,
+                                 provider="claude", outcome=outcome))
+        lines += [
+            "# HELP subscription_wrapper_tokens_total Provider-reported tokens by model and category.",
+            "# TYPE subscription_wrapper_tokens_total counter",
+        ]
+        for model, stats in sorted(self.models.items()):
+            for kind in ("input_uncached", "cache_read", "cache_write", "output", "reasoning"):
+                lines.append(_sample("subscription_wrapper_tokens_total", stats[kind],
+                                     provider="claude", model=model, type=kind))
+        lines += [
+            "# HELP subscription_wrapper_quota_used_ratio Used fraction of a subscription quota window.",
+            "# TYPE subscription_wrapper_quota_used_ratio gauge",
+            "# HELP subscription_wrapper_quota_window_seconds Configured quota window length.",
+            "# TYPE subscription_wrapper_quota_window_seconds gauge",
+            "# HELP subscription_wrapper_quota_reset_timestamp_seconds Quota window reset time.",
+            "# TYPE subscription_wrapper_quota_reset_timestamp_seconds gauge",
+            "# HELP subscription_wrapper_quota_observed_timestamp_seconds Last backend observation time.",
+            "# TYPE subscription_wrapper_quota_observed_timestamp_seconds gauge",
+        ]
+        for group in quota.get("groups", []):
+            observed = group.get("observed_at")
+            for window in group.get("windows", []):
+                labels = {"provider": "claude", "group": group["id"], "window": window["id"]}
+                used = window.get("used_percent")
+                duration = window.get("window_seconds")
+                reset = window.get("resets_at")
+                if used is not None:
+                    lines.append(_sample("subscription_wrapper_quota_used_ratio", used / 100, **labels))
+                if duration is not None:
+                    lines.append(_sample("subscription_wrapper_quota_window_seconds", duration,
+                                         **labels))
+                if reset is not None:
+                    lines.append(_sample("subscription_wrapper_quota_reset_timestamp_seconds", reset,
+                                         **labels))
+                if observed is not None:
+                    lines.append(_sample("subscription_wrapper_quota_observed_timestamp_seconds", observed,
+                                         **labels))
+        return "\n".join(lines) + "\n"
+
+
+def _sample(name, value, **labels):
+    encoded = ",".join(f'{key}="{_escape(str(val))}"' for key, val in sorted(labels.items()))
+    return f"{name}{{{encoded}}} {value}"
+
+
+def _escape(value):
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
 metrics = Metrics(settings.metrics_window)

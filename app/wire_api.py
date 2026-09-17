@@ -158,7 +158,7 @@ async def responses(req: Request):
             "type": "invalid_request_error"}})
 
     try:
-        cli_model, _req_model, effort, identity, cutoff = resolve_request(body.get("model"), body)
+        cli_model, req_model, effort, identity, cutoff = resolve_request(body.get("model"), body)
     except ApiError as err:
         raise HTTPException(status_code=err.status, detail=err.envelope()) from None
 
@@ -184,7 +184,8 @@ async def responses(req: Request):
             total_ms = (time.perf_counter() - t0) * 1000
             metrics.end(stats.get("outcome") or "error", total_ms=total_ms,
                         ttft_ms=stats.get("ttft_ms"), spawn_ms=stats.get("spawn_ms"),
-                        cli_dur_ms=stats.get("cli_duration_ms"), usage=stats.get("usage"))
+                        cli_dur_ms=stats.get("cli_duration_ms"), usage=stats.get("usage"),
+                        model=req_model, reasoning_tokens=stats.get("thinking_tokens"))
             log.info("wire model=%s outcome=%s reused=%s total=%.0fms",
                      cli_model, stats.get("outcome"), stats.get("reused"), total_ms)
 
