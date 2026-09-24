@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import limits
 from .auth import auth_status, require_api_key
 from .cli_driver import drive_turn_events
-from .config import DEFAULT_EFFORT, SERVICE, VERSION, clamp_effort, settings
+from .config import SERVICE, VERSION, clamp_effort, settings
 from .metrics import metrics
 from .translate import (ApiError, build_system_prompt, extract_client_system,
                         messages_to_prompt, openai_tools_to_mcp, resolve_request)
@@ -57,7 +57,7 @@ async def info(req: Request):
 async def models(req: Request):
     """Die Modell-Registry, ungeschminkt.
 
-    Unterschied zu `/v1/models`: dort werden aus sechs echten Modellen vierzehn Einträge,
+    Unterschied zu `/v1/models`: dort werden aus acht echten Modellen fünfzehn Einträge,
     weil Aliase und Effort-Picks (`opus:max`) als Pseudo-Modelle mitlaufen — das braucht ein
     Model-Picker, der die Effort-Wahl über die Modellauswahl abbilden muss. Ein Konsument
     dieser API braucht das Gegenteil: jedes Modell **einmal**, mit seinen Stufen als Feld.
@@ -72,10 +72,12 @@ async def models(req: Request):
         aliases.setdefault(target, []).append(alias)
 
     out = []
-    for mid, (cli_model, name, ctx, levels, cutoff, input_modalities) in settings.models.items():
-        # Der Env-Default gilt nur, soweit das Modell ihn kennt — dieselbe Absenkung, die
-        # ein Request erfährt. Ohne Stufen (Haiku) gibt es keinen Default, nicht "high".
-        default = clamp_effort(settings.effort or DEFAULT_EFFORT, levels) if levels else None
+    for mid, (cli_model, name, ctx, levels, cutoff, input_modalities,
+              model_default_effort) in settings.models.items():
+        # Apply an operator override only as far as the model supports it. Without one,
+        # expose the model's native default, matching an actual request without --effort.
+        requested_default = settings.effort or model_default_effort
+        default = clamp_effort(requested_default, levels) if levels else None
         out.append({
             "id": mid,
             "name": name,

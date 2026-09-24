@@ -155,16 +155,16 @@ Mehr nicht, und das ist Absicht:
 
 ```json
 {"models": [
-  {"id": "opus-5", "name": "Opus 5", "backend_model": "claude-opus-5",
+  {"id": "opus-5-5", "name": "Opus 5.5", "backend_model": "claude-opus-5-5",
    "context_length": 1000000,
    "input_modalities": ["text", "image"],
-   "efforts": {"supported": ["low","medium","high","xhigh","max"], "default": "high"},
-   "knowledge_cutoff": null, "aliases": ["opus"]}
+   "efforts": {"supported": ["low","medium","high","xhigh","max"], "default": "medium"},
+   "knowledge_cutoff": "June 2026", "aliases": ["opus"]}
 ]}
 ```
 
-Der Unterschied zu `/v1/models`: dort werden aus sieben echten Modellen **fünfzehn
-Einträge**, weil vier Aliase und vier Effort-Picks (`opus:max`, `sonnet:low`, …) als
+Der Unterschied zu `/v1/models`: dort werden aus acht echten Modellen **fünfzehn
+Einträge**, weil vier Aliase und drei Effort-Picks (`opus:max`, `sonnet:low`, …) als
 Pseudo-Modelle mitlaufen — das braucht ein Model-Picker, der die Effort-Wahl über die
 Modellauswahl abbilden muss. Ein Konsument dieser API braucht das Gegenteil: jedes Modell
 **einmal**, mit seinen Stufen als Feld und den Aliasen als Liste daran.
@@ -178,10 +178,12 @@ Kontextfenster und Effort-Stufen. Der Claude-CLI-Pfad bietet keinen dynamischen 
 den der Wrapper unverändert durchreichen könnte; deshalb wird die Fähigkeit hier explizit
 geführt, statt vom Consumer aus dem Providernamen erraten zu werden.
 
-`efforts.default` ist der Env-Default, **abgesenkt auf das, was das Modell kennt** — dieselbe
-Absenkung, die ein Request erfährt. Ein Modell ohne Stufen (Haiku) hat `supported: []` und
-`default: null`, nicht `"high"`. `knowledge_cutoff` ist `null`, wo die CLI für ein Modell
-keinen nennt (Opus 5) — wir erfinden dann auch keinen.
+`efforts.default` ist der konfigurierte Env-Default oder, wenn `EFFORT` leer ist, der native
+Default des jeweiligen Modells; in beiden Fällen **abgesenkt auf das, was das Modell kennt** —
+dieselbe Absenkung, die ein Request erfährt. Opus 5.5 steht deshalb auf `medium`, ältere
+effort-fähige Modelle auf `high`. Ein Modell ohne Stufen (Haiku) hat `supported: []` und
+`default: null`. `knowledge_cutoff` ist `null`, wo die CLI für ein Modell keinen nennt
+(Opus 5) — wir erfinden dann auch keinen.
 
 ---
 

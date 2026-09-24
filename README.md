@@ -31,13 +31,14 @@ genuine drop-in OpenAI backend:
 - **Per-request effort control** — OpenAI `reasoning_effort`, OpenRouter `reasoning.effort`, or a
   model-name suffix like `opus:max` (the model picker doubles as an effort selector).
 - **Explicit model list** — a finite, hand-kept registry (`app/config.py`), exposed without the
-  `claude-` prefix: `fable-5-1`, `fable-5`, `opus-5`, `opus-4-8`, `sonnet-5`, `sonnet-4-6`,
-  `haiku-4-5`, plus the
+  `claude-` prefix: `fable-5-1`, `fable-5`, `opus-5-5`, `opus-5`, `opus-4-8`, `sonnet-5`,
+  `sonnet-4-6`, `haiku-4-5`, plus the
   aliases `opus`/`sonnet`/`fable`/`haiku` resolved *by us* — CLI aliases drift with the CLI version.
   An unknown model is a **404 `model_not_found`**, an unsupported effort a **400 `invalid_value`**
-  naming the valid levels; neither silently falls back to a default. Effort levels are validated
-  per model (no `xhigh` before Opus 4.7, none at all on Haiku), and `/v1/models` declares them
-  OpenRouter-style (`supported_efforts`, `context_length`, `name`).
+  naming the valid levels; neither silently falls back to a default. Effort levels and their native
+  defaults are model-specific (Opus 5.5 defaults to `medium`, the older effort-capable models to
+  `high`; no `xhigh` before Opus 4.7, none at all on Haiku), and `/v1/models` declares them
+  OpenRouter-style (`supported_efforts`, `default_effort`, `context_length`, `name`).
 - **Chat-shaped system prompt** — the CLI's default prompt frames the model as a terminal/coding
   agent with file & shell tools that don't exist here (1.4k token on Opus, 6.6k on Sonnet/Haiku).
   With `REPLACE_SYSTEM_PROMPT=1` (default) `SYSTEM_PROMPT_FILE` (`system-prompts/chat.txt`, ~460 token)
@@ -184,7 +185,7 @@ Until authenticated, `/v1/*` requests return **503** with a clear message, and `
 reports `"authenticated": false`. The published port is `127.0.0.1:${PROXY_PORT:-8000}` (localhost
 only).
 
-**The bundled CLI is pinned (`CLAUDE_VERSION=2.1.258`) on purpose** — only versions the assumption
+**The bundled CLI is pinned (`CLAUDE_VERSION=2.1.281`) on purpose** — only versions the assumption
 tests have passed on get shipped. To move the pin up, vet the new version first, then bump it in the
 Dockerfile:
 
@@ -256,7 +257,7 @@ manually, and the token window shown in the UI comes from each model's `maxInput
   "apiKey": "any-value-if-API_KEY-empty",
   "models": [
     { "id": "opus",   "url": "http://127.0.0.1:8000/v1/chat/completions",
-      "maxInputTokens": 1000000, "maxOutputTokens": 32000,
+      "maxInputTokens": 1000000, "maxOutputTokens": 128000,
       "capabilities": { "toolCalling": true } },
     { "id": "sonnet", "url": "http://127.0.0.1:8000/v1/chat/completions",
       "maxInputTokens": 200000,  "maxOutputTokens": 16000 }

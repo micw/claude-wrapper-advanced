@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import responses as rsp
 from .auth import auth_status
-from .config import DEFAULT_EFFORT, SERVICE, VERSION, settings
+from .config import SERVICE, VERSION, clamp_effort, settings
 from .cli_driver import drive_turn
 from .metrics import metrics
 from .translate import (
@@ -179,7 +179,7 @@ async def get_prometheus_metrics():
                              media_type="text/plain; version=0.0.4")
 
 
-def _model_obj(mid, name, ctx, levels, input_modalities, now, pinned=None):
+def _model_obj(mid, name, ctx, levels, input_modalities, now, default_effort=None, pinned=None):
     """Ein /v1/models-Eintrag. Die Zusatzfelder sind OpenRouter-Konvention; strikte
     OpenAI-Clients ignorieren sie, open-webui nutzt 'name' als Anzeigenamen."""
     params = ["tools", "tool_choice"]
@@ -192,7 +192,7 @@ def _model_obj(mid, name, ctx, levels, input_modalities, now, pinned=None):
         params = ["reasoning", "reasoning_effort"] + params
         obj["reasoning"] = {"mandatory": False, "default_enabled": True,
                             "supported_efforts": list(reversed(levels)),
-                            "default_effort": DEFAULT_EFFORT}
+                            "default_effort": default_effort}
     obj["supported_parameters"] = params
     return obj
 
@@ -202,11 +202,16 @@ async def list_models(req: Request):
     _require_auth(req)
     now = int(time.time())
     data = []
-    for mid, (_cli, name, ctx, levels, _cutoff, modalities) in settings.models.items():
-        data.append(_model_obj(mid, name, ctx, levels, modalities, now))
+    for mid, (_cli, name, ctx, levels, _cutoff, modalities,
+              model_default_effort) in settings.models.items():
+        default_effort = clamp_effort(settings.effort or model_default_effort, levels)
+        data.append(_model_obj(mid, name, ctx, levels, modalities, now, default_effort))
     for alias, target in settings.aliases.items():
-        _cli, name, ctx, levels, _cutoff, modalities = settings.models[target]
-        data.append(_model_obj(alias, f"{name.split()[0]} (latest)", ctx, levels, modalities, now))
+        (_cli, name, ctx, levels, _cutoff, modalities,
+         model_default_effort) = settings.models[target]
+        default_effort = clamp_effort(settings.effort or model_default_effort, levels)
+        data.append(_model_obj(alias, f"{name.split()[0]} (latest)", ctx, levels, modalities,
+                               now, default_effort))
     for alias, eff in settings.effort_picks:
         target = settings.aliases.get(alias, alias)
         entry = settings.models.get(target)
@@ -214,7 +219,7 @@ async def list_models(req: Request):
             log.warning("EFFORT_PICKS: '%s:%s' übersprungen (Modell oder Stufe unbekannt)",
                         alias, eff)
             continue
-        _cli, name, ctx, _levels, _cutoff, modalities = entry
+        _cli, name, ctx, _levels, _cutoff, modalities, _model_default_effort = entry
         data.append(_model_obj(f"{alias}:{eff}", f"{name.split()[0]} · {eff} effort",
                                ctx, (), modalities, now, pinned=eff))
     return {"object": "list", "data": data}

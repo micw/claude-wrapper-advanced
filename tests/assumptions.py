@@ -165,9 +165,22 @@ async def minimal_usage_probe(model):
     capture = getattr(proc, "turn_header_capture", None)
     if capture is not None:
         await capture.close()
+    try:
+        result = json.loads(out)
+    except (TypeError, ValueError):
+        result = None
     if proc.returncode != 0:
+        if result and result.get("api_error_status") == 429 \
+                and result.get("api_error_code") == "credits_required":
+            return result, limits.quota_snapshot()
         raise RuntimeError((err or b"")[-300:].decode(errors="replace"))
-    return json.loads(out), limits.quota_snapshot()
+    return result, limits.quota_snapshot()
+
+
+def credits_required(result):
+    return bool(result and result.get("is_error")
+                and result.get("api_error_status") == 429
+                and result.get("api_error_code") == "credits_required")
 
 
 # ================================================================ TIER 1: OFFLINE
@@ -404,10 +417,19 @@ async def c_probe_haiku(ctx):
     return probe_magnitude(result, quota, "haiku-4-5", 300, 0.0001, 0.01)
 
 
+@check("usage.probe_opus_5_5_magnitude", 2,
+       "Minimal Opus 5.5 probe stays small and yields global headers")
+async def c_probe_opus_5_5(ctx):
+    result, quota = await minimal_usage_probe(settings.models["opus-5-5"][0])
+    return probe_magnitude(result, quota, "opus-5-5", 300, 0.0001, 0.03)
+
+
 @check("usage.probe_fable_magnitude", 2,
        "Minimal Fable quota probe stays small and yields scoped headers")
 async def c_probe_fable(ctx):
     result, quota = await minimal_usage_probe(settings.models["fable-5-1"][0])
+    if credits_required(result):
+        return SKIP("Fable is recognized but this account requires usage credits")
     return probe_magnitude(result, quota, "fable-5-1", 100, 0.0002, 0.02)
 
 
@@ -468,6 +490,33 @@ async def c_tooluse(ctx):
         if not name.startswith("mcp__t__"):
             return FAIL(f"unexpected tool name: {name}")
         return OK(f"name={name}")
+
+
+@check("tools.opus_5_5_native_tooluse", 2,
+       "Opus 5.5 still emits native MCP tool_use with always-on adaptive thinking")
+async def c_opus_5_5_tooluse(ctx):
+    tools = [{"name": "get_weather", "description": "Live weather for a city",
+              "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}},
+                              "required": ["city"]}}]
+    model = settings.models["opus-5-5"][0]
+    async with CLI(mcp_tools=tools, model=model, extra=["--effort", "medium"]) as cli:
+        await cli.send("What is the weather in Berlin? You MUST call the get_weather tool.")
+
+        def is_tooluse(e):
+            if e.get("type") == "assistant":
+                blocks = (e.get("message") or {}).get("content") or []
+                return any(b.get("type") == "tool_use" for b in blocks)
+            return e.get("type") == "result"
+
+        ev, _seen = await cli.events_until(is_tooluse, timeout=90)
+        await cli.interrupt()
+    if not ev or ev.get("type") == "result":
+        return FAIL("Opus 5.5 produced no native tool_use")
+    blocks = (ev.get("message") or {}).get("content") or []
+    tool = next((b for b in blocks if b.get("type") == "tool_use"), None)
+    name = (tool or {}).get("name", "")
+    return OK(f"name={name}") if name.startswith("mcp__t__") \
+        else FAIL(f"unexpected tool name: {name}")
 
 
 @check("tools.no_result_on_tooluse", 2, "Tool turns emit NO result event (usage only from assistant msg)")
@@ -564,12 +613,21 @@ async def c_models(ctx):
     # Wir reichen nur volle Namen an die CLI (nie Aliase — die driften mit der CLI-Version).
     # Ein CLI-Update, das einen Namen fallen lässt, muss hier auffallen und nicht im Betrieb.
     res = {}
-    for cli_model, _name, _ctx, _levels, _cutoff, _modalities in settings.models.values():
+    unavailable = []
+    for (cli_model, _name, _ctx, _levels, _cutoff, _modalities,
+         _default_effort) in settings.models.values():
         async with CLI(model=cli_model) as cli:
             ev, _ = await cli.turn("Reply with exactly: OK")
-            res[cli_model] = bool(ev) and not ev.get("is_error")
+            if credits_required(ev):
+                unavailable.append(cli_model)
+                res[cli_model] = True
+            else:
+                res[cli_model] = bool(ev) and not ev.get("is_error")
     bad = [m for m, ok in res.items() if not ok]
-    return OK(f"accepted: {len(res)}") if not bad else FAIL(f"rejected: {bad}")
+    if bad:
+        return FAIL(f"rejected: {bad}")
+    suffix = f"; credits required: {unavailable}" if unavailable else ""
+    return OK(f"recognized: {len(res)}{suffix}")
 
 
 @check("model.unknown_is_404", 2,
@@ -779,23 +837,26 @@ async def c_image_dropped(ctx):
             else OK(f"turn completed, image dropped with a note: {str(ev.get('result'))[:40]!r}"))
 
 
-@check("cli.streams_continuously", 2, "CLI never goes silent mid-turn (the basis for IDLE_TIMEOUT)")
+@check("cli.streams_continuously", 2,
+       "CLI emits continuously during long thinking (the basis for IDLE_TIMEOUT)")
 async def c_streams(ctx):
     """Our timeout is an idle window, not a total deadline — that only holds if the CLI keeps
     emitting while it works. It does: thinking_deltas flow while the model reasons (they carry
     no text, only estimated_tokens, but they keep the stream alive). Measured worst case is the
-    prefill gap: ~10s at 1MB of context, <2s otherwise.
+    prefill gap: ~10s at 1MB of context, <2s otherwise. Observe a bounded sample rather than
+    waiting for an xhigh Opus turn that can legitimately reason for many minutes.
     """
-    async with CLI(model="opus", extra=["--effort", "xhigh"]) as cli:
+    async with CLI(model=settings.models[settings.aliases["opus"]][0],
+                   extra=["--effort", "xhigh"]) as cli:
         await cli.send("Prove rigorously whether 1729 is the smallest number expressible as a sum "
                        "of two positive cubes in two different ways. Verify alternatives carefully.")
         loop = asyncio.get_event_loop()
-        last, maxgap, kinds = loop.time(), 0.0, set()
-        while True:
+        last, maxgap, kinds, samples, terminal = loop.time(), 0.0, set(), 0, False
+        while samples < 20 and not terminal:
             try:
-                raw = await asyncio.wait_for(cli.proc.stdout.readline(), timeout=180)
+                raw = await asyncio.wait_for(cli.proc.stdout.readline(), timeout=settings.idle_timeout)
             except asyncio.TimeoutError:
-                return FAIL("no line for 180s")
+                return FAIL(f"no line for {settings.idle_timeout:.0f}s")
             if not raw:
                 return FAIL("stream ended without a result")
             now = loop.time()
@@ -808,8 +869,12 @@ async def c_streams(ctx):
             d = ((m.get("event") or {}).get("delta") or {})
             if d.get("type"):
                 kinds.add(d["type"])
+                samples += 1
             if m.get("type") == "result":
-                break
+                terminal = True
+        if not terminal:
+            await cli.interrupt()
+            await cli.result(timeout=settings.clear_timeout + 10)
     ctx["max_gap_s"] = maxgap
     thinking = "thinking_delta" in kinds
     if maxgap > settings.idle_timeout / 2:
@@ -823,7 +888,8 @@ async def c_streams(ctx):
 async def c_thinking(ctx):
     """If this ever starts carrying text, we can forward it as reasoning_content and the long
     silent wait before the first token becomes visible to the user."""
-    async with CLI(model="opus", extra=["--effort", "xhigh"]) as cli:
+    async with CLI(model=settings.models[settings.aliases["opus"]][0],
+                   extra=["--effort", "xhigh"]) as cli:
         await cli.send("Think hard, then answer: is 8191 prime? Verify by trial division.")
         seen, texty = 0, False
         while seen < 5:

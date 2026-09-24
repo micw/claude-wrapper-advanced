@@ -404,7 +404,7 @@ def resolve_model(m):
     if entry is None:
         raise ApiError(404, f"The model `{m}` does not exist or you do not have access to it.",
                        code="model_not_found", param="model")
-    cli_model, name, _ctx, levels, cutoff, _input_modalities = entry
+    cli_model, name, _ctx, levels, cutoff, _input_modalities, _default_effort = entry
     return cli_model, canon, levels, name, cutoff
 
 

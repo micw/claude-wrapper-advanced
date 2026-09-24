@@ -309,7 +309,8 @@ class TestPureHelpers(unittest.TestCase):
 
     def test_resolve_model_maps_alias_and_number(self):
         self.assertEqual(resolve_model("opus-5")[:2], ("claude-opus-5", "opus-5"))
-        self.assertEqual(resolve_model("opus")[:2], ("claude-opus-5", "opus-5"))
+        self.assertEqual(resolve_model("opus-5-5")[:2], ("claude-opus-5-5", "opus-5-5"))
+        self.assertEqual(resolve_model("opus")[:2], ("claude-opus-5-5", "opus-5-5"))
         self.assertEqual(resolve_model("haiku-4-5")[:2], ("claude-haiku-4-5", "haiku-4-5"))
         # Leer -> DEFAULT_MODEL, aber der muss selbst in der Liste stehen.
         self.assertEqual(resolve_model("")[1], settings.aliases.get(settings.default_model,
@@ -359,13 +360,14 @@ class TestPureHelpers(unittest.TestCase):
     def test_resolve_request_precedence(self):
         # Name-Suffix schlägt Body.
         self.assertEqual(resolve_request("opus:max", {"reasoning_effort": "low"})[:3],
-                         ("claude-opus-5", "opus-5", "max"))
+                         ("claude-opus-5-5", "opus-5-5", "max"))
         self.assertEqual(resolve_request("opus", {"reasoning_effort": "low"})[:3],
-                         ("claude-opus-5", "opus-5", "low"))
+                         ("claude-opus-5-5", "opus-5-5", "low"))
 
     def test_resolve_request_returns_identity_and_cutoff(self):
         # identity/cutoff kommen aus der Registry, für den Replace-Basis-Prompt.
         self.assertEqual(resolve_request("sonnet-4-6", {})[3:], ("Claude Sonnet 4.6", "August 2025"))
+        self.assertEqual(resolve_request("opus", {})[3:], ("Claude Opus 5.5", "June 2026"))
         self.assertEqual(resolve_request("opus-5", {})[3:], ("Claude Opus 5", None))  # kein Cutoff
 
 

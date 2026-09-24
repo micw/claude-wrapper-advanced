@@ -10,7 +10,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Die Version wird mit dem Git-Tag mitgeführt (ab 1.6.0; davor stand sie auf 1.3.2, während
 # die Tags schon bei 1.5.2 lagen — die Tags waren und bleiben die Wahrheit).
 SERVICE = "claude-wrapper-advanced"
-VERSION = "1.10.0"
+VERSION = "1.12.0"
 
 
 def _truthy(v) -> bool:
@@ -25,26 +25,27 @@ def _truthy(v) -> bool:
 EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 _EFF5 = EFFORT_ORDER
 _EFF4 = ("low", "medium", "high", "max")      # 'xhigh' gibt es erst ab Opus 4.7
-DEFAULT_EFFORT = "high"                       # CLI-Default auf allen Modellen außer Opus 4.7
 
-# Felder: (CLI-Modell, Anzeigename, Kontext, Effort-Stufen, knowledge-cutoff, Inputmodalitäten).
+# Fields: CLI model, display name, context, effort levels, knowledge cutoff,
+# input modalities, and the model's native default effort.
 # Cutoff wird im Replace-Modus mitgegeben, weil der CLI-Default — der ihn sonst pro Modell
 # liefert — dann weg ist und das Modell seine eigene Grenze sonst ~1 Jahr zu früh rät.
 # Werte aus dem CLI-Default abgelesen (tests/assumptions.py::model.registry gleicht sie ab);
 # None = die CLI nennt für dieses Modell keinen Cutoff (z.B. Opus 5) -> wir nennen auch keinen.
 # Pflege bei Modell-Releases, dieselbe Kadenz wie die Modell-Liste selbst.
 MODELS = {
-    # externe ID     CLI-Modell             Anzeige       Kontext    Effort  Cutoff           Input
-    "fable-5-1":  ("claude-fable-5-1",  "Fable 5.1",  1_000_000, _EFF5, "June 2026",       ("text", "image")),
-    "opus-5":     ("claude-opus-5",     "Opus 5",     1_000_000, _EFF5, None,              ("text", "image")),
-    "opus-4-8":   ("claude-opus-4-8",   "Opus 4.8",   1_000_000, _EFF5, "January 2026",    ("text", "image")),
-    "sonnet-5":   ("claude-sonnet-5",   "Sonnet 5",   1_000_000, _EFF5, "January 2026",    ("text", "image")),
-    "fable-5":    ("claude-fable-5",    "Fable 5",    1_000_000, _EFF5, "January 2026",    ("text", "image")),
-    "sonnet-4-6": ("claude-sonnet-4-6", "Sonnet 4.6", 1_000_000, _EFF4, "August 2025",     ("text", "image")),
-    "haiku-4-5":  ("claude-haiku-4-5",  "Haiku 4.5",    200_000, (),    "February 2025",   ("text", "image")),
+    # external ID       CLI model               display        context      effort  cutoff           input              default
+    "fable-5-1":  ("claude-fable-5-1",   "Fable 5.1",   1_000_000, _EFF5, "June 2026",       ("text", "image"), "high"),
+    "opus-5-5":   ("claude-opus-5-5",    "Opus 5.5",    1_000_000, _EFF5, "June 2026",       ("text", "image"), "medium"),
+    "opus-5":     ("claude-opus-5",      "Opus 5",      1_000_000, _EFF5, None,              ("text", "image"), "high"),
+    "opus-4-8":   ("claude-opus-4-8",    "Opus 4.8",    1_000_000, _EFF5, "January 2026",    ("text", "image"), "high"),
+    "sonnet-5":   ("claude-sonnet-5",    "Sonnet 5",    1_000_000, _EFF5, "January 2026",    ("text", "image"), "high"),
+    "fable-5":    ("claude-fable-5",     "Fable 5",     1_000_000, _EFF5, "January 2026",    ("text", "image"), "high"),
+    "sonnet-4-6": ("claude-sonnet-4-6",  "Sonnet 4.6",  1_000_000, _EFF4, "August 2025",     ("text", "image"), "high"),
+    "haiku-4-5":  ("claude-haiku-4-5",   "Haiku 4.5",     200_000, (),    "February 2025",   ("text", "image"), None),
 }
 
-ALIASES = {"opus": "opus-5", "sonnet": "sonnet-5",
+ALIASES = {"opus": "opus-5-5", "sonnet": "sonnet-5",
            "haiku": "haiku-4-5", "fable": "fable-5-1"}
 # 'best' bewusst nicht: der CLI-Alias bedeutet "Fable, wo verfügbar, sonst neuestes Opus" —
 # eine statische Abbildung verliert diese Fallback-Semantik und dupliziert nur 'fable'.
@@ -57,10 +58,9 @@ MODEL_LIMIT_GROUPS = {
     "fable-5": ("fable",),
 }
 
-# Leiter von Absichten statt Kreuzprodukt: jeder Eintrag beantwortet "warum der und
-# nicht der daneben". Kleines Modell auf hoher Stufe fehlt bewusst — dafür gibt es
-# das größere Modell auf Default.
-DEFAULT_EFFORT_PICKS = "sonnet:low,opus:medium,opus:xhigh,opus:max"
+# A ladder of intents rather than a cross product. Picks that duplicate a model's
+# native default are deliberately omitted.
+DEFAULT_EFFORT_PICKS = "sonnet:low,opus:xhigh,opus:max"
 
 
 def _parse_picks(raw):
@@ -178,8 +178,8 @@ class Settings:
         self.models = MODELS
         self.aliases = ALIASES
         self.model_limit_groups = MODEL_LIMIT_GROUPS
-        # Picker-Einträge mit festgenagelter Effort-Stufe ('opus:medium'). Leer = keine.
-        # Kein ':high' — das ist der Default und wäre ein Duplikat der nackten ID.
+        # Picker entries with a pinned effort level. Empty disables them; native defaults
+        # are omitted because the plain model ID already represents that choice.
         self.effort_picks = _parse_picks(os.getenv("EFFORT_PICKS", DEFAULT_EFFORT_PICKS))
         # Neutrales Arbeitsverzeichnis, damit die CLI kein CLAUDE.md/Projekt aufsammelt.
         self.workdir = os.getenv("WORKDIR") or tempfile.mkdtemp(prefix="claude-proxy-")

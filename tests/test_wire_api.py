@@ -104,10 +104,53 @@ class Models(unittest.TestCase):
             if supported:
                 self.assertIn(default, supported, m["id"])
 
+    def test_native_default_effort_is_model_specific(self):
+        by_id = {m["id"]: m for m in self.models}
+        self.assertEqual(by_id["opus-5-5"]["efforts"]["default"], "medium")
+        self.assertEqual(by_id["opus-5"]["efforts"]["default"], "high")
+
+    def test_operator_default_overrides_and_clamps_native_defaults(self):
+        from unittest import mock
+        with mock.patch.object(settings, "effort", "xhigh"):
+            by_id = {m["id"]: m for m in call(wire_api.models)["models"]}
+        self.assertEqual(by_id["opus-5-5"]["efforts"]["default"], "xhigh")
+        self.assertEqual(by_id["sonnet-4-6"]["efforts"]["default"], "high")
+
     def test_cutoff_is_null_where_the_cli_names_none(self):
         """Opus 5 hat keinen — dann nennen wir auch keinen, statt einen zu erfinden."""
         opus5 = next(m for m in self.models if m["id"] == "opus-5")
         self.assertIsNone(opus5["knowledge_cutoff"])
+
+    def test_opus_5_5_metadata(self):
+        opus = next(m for m in self.models if m["id"] == "opus-5-5")
+        self.assertEqual(opus["backend_model"], "claude-opus-5-5")
+        self.assertEqual(opus["context_length"], 1_000_000)
+        self.assertEqual(opus["knowledge_cutoff"], "June 2026")
+        self.assertEqual(opus["aliases"], ["opus"])
+
+
+class OpenAIModels(unittest.TestCase):
+    def setUp(self):
+        from app import main
+        self.models = {m["id"]: m for m in call(main.list_models)["data"]}
+
+    def test_opus_alias_uses_5_5_metadata_and_default(self):
+        self.assertEqual(self.models["opus-5-5"]["reasoning"]["default_effort"], "medium")
+        self.assertEqual(self.models["opus"]["reasoning"]["default_effort"], "medium")
+        self.assertEqual(self.models["opus"]["name"], "Opus (latest)")
+
+    def test_default_effort_is_not_duplicated_as_a_picker(self):
+        self.assertNotIn("opus:medium", self.models)
+        self.assertIn("opus:xhigh", self.models)
+        self.assertIn("opus:max", self.models)
+
+    def test_operator_default_is_exposed_on_openai_models(self):
+        from app import main
+        from unittest import mock
+        with mock.patch.object(settings, "effort", "xhigh"):
+            models = {m["id"]: m for m in call(main.list_models)["data"]}
+        self.assertEqual(models["opus"]["reasoning"]["default_effort"], "xhigh")
+        self.assertEqual(models["sonnet-4-6"]["reasoning"]["default_effort"], "high")
 
 
 if __name__ == "__main__":
