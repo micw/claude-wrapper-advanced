@@ -1,5 +1,6 @@
 """Age-controlled quota probes and explicit force modes (all offline)."""
 import asyncio
+import json
 import time
 import unittest
 from unittest import mock
@@ -38,6 +39,18 @@ class ProbePolicy(unittest.IsolatedAsyncioTestCase):
         settings.usage_global_max_age = self.old_global
         settings.usage_fable_max_age = self.old_fable
         limits._reset_observations()
+
+    async def test_cli_credit_error_is_reported_without_raw_output(self):
+        output = json.dumps({"type": "result", "is_error": True,
+                             "result": "Fable 5.1 requires usage credits. token=private"}).encode()
+        self.assertEqual(limits._probe_error_detail(output, b""),
+                         "model requires usage credits")
+
+    async def test_other_cli_errors_keep_stderr_fallback(self):
+        output = json.dumps({"type": "result", "is_error": True,
+                             "result": "Unrecognized response"}).encode()
+        self.assertEqual(limits._probe_error_detail(output, b"CLI failed"), "CLI failed")
+        self.assertEqual(limits._probe_error_detail(b"invalid json", b"CLI failed"), "CLI failed")
 
     async def test_fresh_observations_need_no_probe(self):
         fresh_both()

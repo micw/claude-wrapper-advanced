@@ -11,6 +11,7 @@ and age — no status/severity policy that belongs to the consumer.
 """
 import asyncio
 import contextlib
+import json
 import logging
 import time
 
@@ -235,6 +236,18 @@ def _reset_observations():
 
 # ---------------------------------------------------------------------- probes
 
+def _probe_error_detail(output, stderr):
+    """Extract the CLI's JSON error without exposing arbitrary model output."""
+    try:
+        result = json.loads(output)
+        message = result.get("result") if result.get("is_error") is True else None
+        if isinstance(message, str) and "requires usage credits" in message.lower():
+            return "model requires usage credits"
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return (stderr or b"")[-300:].decode(errors="replace")
+
+
 async def _probe(kind):
     """Run the smallest real CLI turn. A Fable response refreshes both groups."""
     model_id = "haiku-4-5" if kind == "global" else _FABLE_MODELS[0]
@@ -254,7 +267,7 @@ async def _probe(kind):
     proc = await spawn_cli(args, cli_model, stdin=asyncio.subprocess.DEVNULL)
     try:
         try:
-            _out, err = await asyncio.wait_for(proc.communicate(), settings.usage_probe_timeout)
+            out, err = await asyncio.wait_for(proc.communicate(), settings.usage_probe_timeout)
         except asyncio.TimeoutError:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
@@ -264,7 +277,7 @@ async def _probe(kind):
         if capture is not None:
             await capture.close()  # pipe EOF guarantees all response events were consumed
         if proc.returncode != 0:
-            detail = (err or b"")[-300:].decode(errors="replace")
+            detail = _probe_error_detail(out, err)
             raise UsageUnavailable(f"{kind} usage probe exited {proc.returncode}: {detail}")
         if _observed[target]["revision"] == before:
             raise UsageUnavailable(f"{kind} usage probe returned no quota headers")
